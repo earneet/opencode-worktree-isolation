@@ -6,6 +6,17 @@
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "license": "MIT",
+    "files": [
+        "dist"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/earneet/opencode-worktree-isolation.git"
+    },
+    "homepage": "https://github.com/earneet/opencode-worktree-isolation#readme",
+    "bugs": {
+        "url": "https://github.com/earneet/opencode-worktree-isolation/issues"
+    },
     "scripts": {
         "build": "tsc",
         "prepare": "tsc",
@@ -21,8 +32,7 @@
         "isolation"
     ],
     "dependencies": {
-        "@opencode-ai/plugin": "1.17.4",
-        "zod": "^3.23.8"
+        "@opencode-ai/plugin": "1.17.4"
     },
     "devDependencies": {
         "@types/node": "^26.1.2",
