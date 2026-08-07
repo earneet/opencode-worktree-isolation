@@ -80,6 +80,19 @@ This creates a git worktree, binds the current session to it, and from this poin
 
 After `worktree_prepare`, just use file tools as usual. Writes, edits, reads, globs, greps, and bash commands all land in the worktree automatically. The agent knows it's in the worktree (via system prompt) and generates correct paths.
 
+### Merge your work
+
+When the task is complete and you want to integrate the changes back:
+
+```
+worktree_merge(action="preview")   // review the merge plan (target branch, commits, diff)
+worktree_merge(action="apply")     // merge + auto-cleanup + unbind
+```
+
+`worktree_merge` merges the worktree's branch into the main checkout's current branch, then automatically removes the worktree, deletes the branch, and unbinds the session. Any uncommitted changes in the worktree are auto-committed first (so no work is lost). If the merge hits conflicts, it aborts safely and leaves the repo clean.
+
+After merging, the session is unbound and file operations target the repo root again. Use `worktree_cleanup` instead when you want to discard a worktree without merging.
+
 ### Clean up
 
 When the task is done:

@@ -234,3 +234,18 @@ F:\workspace_2\oc-plugin\
 - **副作用/破坏性**：拦截仅对已绑定会话生效（普通会话零影响）；`.git` 路径永不改写；cleanup 默认 preview、apply 只删已合并分支——安全。
 - **更简单的替代**：考虑过"内存态 state、跳过懒继承"——均被否决（前者重启丢绑定；后者子 agent 漂移是真实漏洞，用户最恨漂移）。
 - **遗漏**：`task` 子 agent 路径已用懒继承处理；bash 串替换的边角（8.3 短名、混合大小写）记为 v1 已知限制。
+
+## 15. worktree_merge（v0.2 增补：完成后合并 + 自动清理退出）
+
+参考 Claude Code 的"完成工作后合并/清理"模型，新增 `worktree_merge` 工具，补齐生命周期最后一环：prepare → work → **merge**（整合）或 cleanup（丢弃）。
+
+**设计要点**：
+- **合并目标** = 主检出 R 当前所在分支（"合并到你所在的地方"），preview 明确展示
+- **preview/apply 两段式**：符合"用户授意"——preview 给出合并计划（目标分支、待合并提交、diff stat、未提交变更数），确认后再 apply
+- **未提交变更自动快照**：worktree 里的未提交变更在合并前自动 `chore(worktree): pre-merge snapshot` 提交，不丢工作
+- **主检出保护**：主检出有未提交的**已跟踪**变更时拒绝合并（untracked 文件不阻断，因为 merge 不碰它们）
+- **冲突安全回滚**：`git merge --no-ff` 失败则 `git merge --abort`，仓库保持干净
+- **合并后自动清理**：删 worktree → 删分支（`-d` 安全删除，因已合并）→ 解绑会话；拦截随 resolveBinding 返回 null 自动停止
+- **绕过拦截 hook**：merge 用内部 `git()` helper（cwd 显式 = R），不经过 bash 工具的 `tool.execute.before` 改写，不受会话绑定影响
+
+**已实测**（干净仓库 E2E）：prepare → write（落入 worktree）→ merge preview → merge apply → 文件出现在仓库根、worktree 已删、分支已删、state `sessions: {}`。git log 显示 `Merge worktree 'wt/...'`（--no-ff）← `pre-merge snapshot` ← base。

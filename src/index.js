@@ -387,6 +387,122 @@ const WorktreePlugin = async (ctx) => {
                     )
                 },
             }),
+
+            worktree_merge: tool({
+                description:
+                    "Merge a worktree's branch back into the main checkout, then clean up. " +
+                    "preview: show the merge plan (target branch, commits, diff stat, uncommitted changes) without merging. " +
+                    "apply: auto-commit any uncommitted worktree changes, merge the branch into the main checkout's current branch, " +
+                    "then remove the worktree, delete the branch, and unbind the session. " +
+                    "Use this to integrate finished worktree work. Aborts safely on merge conflicts.",
+                args: {
+                    action: z.enum(["preview", "apply"]).describe("preview = show merge plan only; apply = merge + cleanup + unbind"),
+                    branch: z
+                        .string()
+                        .optional()
+                        .describe("Worktree branch to merge; defaults to this session's bound worktree branch"),
+                },
+                async execute(args, tctx) {
+                    const R = tctx.directory
+                    const pid = computeProjectId(R)
+                    const state = loadState(pid)
+
+                    let branch = args.branch
+                    let boundSid = null
+                    if (!branch) {
+                        const binding = state.sessions[tctx.sessionID]
+                        if (!binding)
+                            return "❌ No worktree is bound to this session. Pass branch=<name> to merge a specific worktree."
+                        branch = binding.branch
+                        boundSid = tctx.sessionID
+                    } else {
+                        const entry = Object.entries(state.sessions).find(([, b]) => b.branch === branch)
+                        boundSid = entry ? entry[0] : null
+                    }
+                    const binding = boundSid ? state.sessions[boundSid] : null
+                    if (!binding) return `❌ No managed worktree found for branch "${branch}".`
+                    const W = binding.path
+
+                    const targetRes = git(["symbolic-ref", "--short", "HEAD"], R)
+                    if (!targetRes.ok)
+                        return `❌ Cannot determine the current branch of ${R}: ${targetRes.stderr.trim()}`
+                    const target = targetRes.stdout.trim()
+                    if (target === branch) return `❌ The main checkout is already on "${branch}" — nothing to merge.`
+
+                    const logRes = git(["log", `${target}..${branch}`, "--oneline"], R)
+                    const commits = logRes.ok ? logRes.stdout.trim() : ""
+                    const diffRes = git(["diff", `${target}...${branch}`, "--stat"], R)
+                    const diffStat = diffRes.ok ? diffRes.stdout.trim() : ""
+                    const dirtyRes = git(["status", "--porcelain"], W)
+                    const dirty = dirtyRes.ok ? dirtyRes.stdout.trim() : ""
+                    const dirtyCount = dirty ? dirty.split("\n").length : 0
+
+                    if (args.action === "preview") {
+                        return (
+                            `Merge preview: "${branch}" → "${target}"\n` +
+                            `   worktree: ${W}\n` +
+                            `   commits to merge:\n${commits ? commits.split("\n").map((l) => "     " + l).join("\n") : "     (none — already up to date)"}\n` +
+                            `   diff stat:\n${diffStat ? diffStat.split("\n").map((l) => "     " + l).join("\n") : "     (no file changes)"}\n` +
+                            (dirtyCount
+                                ? `   ⚠ ${dirtyCount} uncommitted change(s) in the worktree will be auto-committed before merge.\n`
+                                : "") +
+                            `\nApply with: worktree_merge(action="apply"${args.branch ? `, branch="${branch}"` : ""}). ` +
+                            `The merge aborts safely if conflicts arise.`
+                        )
+                    }
+
+                    const rDirty = git(["status", "--porcelain"], R)
+                    const trackedChanges = rDirty.ok
+                        ? rDirty.stdout
+                              .split("\n")
+                              .filter((l) => l.trim() && !l.startsWith("??"))
+                              .join("\n")
+                              .trim()
+                        : ""
+                    if (trackedChanges) {
+                        return (
+                            `❌ The main checkout ${R} has uncommitted tracked changes. Commit or stash them before merging:\n` +
+                            trackedChanges
+                        )
+                    }
+                    if (dirtyCount) {
+                        git(["add", "-A"], W)
+                        const c = git(["commit", "-m", "chore(worktree): pre-merge snapshot", "--allow-empty"], W)
+                        if (!c.ok) return `❌ Failed to commit worktree changes before merge: ${c.stderr.trim()}`
+                    }
+                    const mergeRes = git(["merge", "--no-ff", "-m", `Merge worktree '${branch}'`, branch], R)
+                    if (!mergeRes.ok) {
+                        git(["merge", "--abort"], R)
+                        return (
+                            `❌ Merge of "${branch}" into "${target}" failed (likely conflicts). The merge was aborted; the repo is left clean.\n` +
+                            `${(mergeRes.stderr || mergeRes.stdout).trim()}\n` +
+                            `Resolve conflicts manually (or rebase "${branch}" onto "${target}") and retry.`
+                        )
+                    }
+                    if (existsSync(W)) {
+                        const rm = git(["worktree", "remove", "--force", W], R)
+                        if (!rm.ok) {
+                            return (
+                                `⚠ Merged "${branch}" into "${target}", but worktree removal failed: ${rm.stderr.trim()}\n` +
+                                `Worktree left at ${W}; branch "${branch}" kept. Remove manually when ready.`
+                            )
+                        }
+                    } else {
+                        git(["worktree", "prune"], R)
+                    }
+                    git(["branch", "-d", branch], R)
+                    if (boundSid && state.sessions[boundSid]) {
+                        delete state.sessions[boundSid]
+                        saveState(pid, state)
+                    }
+                    return (
+                        `✅ Merged "${branch}" into "${target}" and cleaned up.\n` +
+                        `   worktree removed: ${W}\n` +
+                        `   branch deleted:   ${branch}\n` +
+                        `   session unbound — file operations now target the repo root (${R}) again.`
+                    )
+                },
+            }),
         },
 
         "tool.execute.before": async (input, output) => {
