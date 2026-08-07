@@ -59,7 +59,7 @@ Then register with an absolute path:
 {
     "$schema": "https://opencode.ai/config.json",
     "plugin": [
-        "/absolute/path/to/opencode-worktree-guard/src/index.js"
+        "/absolute/path/to/opencode-worktree-guard/index.js"
     ]
 }
 ```
@@ -165,6 +165,18 @@ When a bound session spawns subagents via `task()`, the subagent's session autom
 - **No TUI indicator**: opencode 1.18's plugin API doesn't support dynamic session title/metadata updates, so the worktree branch isn't visible in the status bar. The agent's responses will mention the worktree context.
 - **Single worktree per session**: A session can be bound to one worktree at a time. For true parallel work, use separate opencode sessions.
 - **Bash path replacement is string-based**: Complex command strings with unusual path formats (8.3 short names, mixed separators) may not be fully rewritten. The plugin blocks commands where residual repo-root paths are detected after replacement.
+
+## Testing
+
+The plugin ships with a test suite using Node's built-in test runner (zero extra dependencies):
+
+```bash
+npm install
+npm test
+```
+
+- **Unit tests** (`test/unit.test.js`): path normalization/containment/rewriting, branch-name validation (option/path-traversal injection), slugify, and the `applyInterception` logic for every intercepted tool (write/edit/read/glob/grep/bash), including `.git` blocking and bash repo-root replacement.
+- **Integration tests** (`test/lifecycle.test.js`): full lifecycle against a real temporary git repo — prepare → interception → merge preview/apply → cleanup — with state and worktree directories isolated via `OC_WT_STATE_DIR` / `OC_WT_ROOT` env vars.
 
 ## Design
 

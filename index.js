@@ -1,161 +1,27 @@
-import { createHash } from "node:crypto"
-import { spawnSync } from "node:child_process"
-import {
-    existsSync,
-    mkdirSync,
-    readFileSync,
-    writeFileSync,
-    statSync,
-    copyFileSync,
-    symlinkSync,
-} from "node:fs"
-import { homedir } from "node:os"
 import * as path from "node:path"
 import { tool } from "@opencode-ai/plugin"
+import {
+    IS_WIN,
+    MAX_PARENT_DEPTH,
+    git,
+    computeProjectId,
+    validateBranch,
+    slugify,
+    loadConfig,
+    resolveWorktreeRoot,
+    defaultBaseBranch,
+    runHookCommands,
+    loadState,
+    saveState,
+    applyInterception,
+    existsSync,
+    mkdirSync,
+    copyFileSync,
+    statSync,
+    symlinkSync,
+} from "./lib.js"
 
 const z = tool.schema
-
-const IS_WIN = process.platform === "win32"
-const DEFAULT_WORKTREE_ROOT = path.join(homedir(), ".local", "share", "opencode", "worktree")
-const STATE_DIR = path.join(homedir(), ".local", "share", "opencode", "worktree-workflow")
-const MAX_PARENT_DEPTH = 10
-const BRANCH_INVALID_CHARS = /[~^:?*[\]\\]/
-
-function git(args, cwd) {
-    const r = spawnSync("git", args, { cwd, encoding: "utf8" })
-    if (r.error) return { ok: false, stdout: "", stderr: String(r.error) }
-    if (r.status !== 0) return { ok: false, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
-    return { ok: true, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
-}
-
-const projectIdCache = new Map()
-function computeProjectId(repoRoot) {
-    if (projectIdCache.has(repoRoot)) return projectIdCache.get(repoRoot)
-    let id = null
-    const r = git(["rev-list", "--max-parents=0", "--all"], repoRoot)
-    if (r.ok) {
-        const roots = r.stdout
-            .split("\n")
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .sort()
-        if (roots.length && /^[a-f0-9]{40}$/i.test(roots[0])) id = roots[0]
-    }
-    if (!id) id = createHash("sha256").update(repoRoot).digest("hex").slice(0, 16)
-    projectIdCache.set(repoRoot, id)
-    return id
-}
-
-function norm(p) {
-    return path.resolve(p).replace(/\\/g, "/").toLowerCase()
-}
-function isInside(p, base) {
-    const np = norm(p)
-    const nb = norm(base)
-    return np === nb || np.startsWith(nb + "/")
-}
-function rewritesToWorktree(filePath, repoRoot, worktreePath) {
-    if (isInside(filePath, worktreePath)) return filePath
-    if (!isInside(filePath, repoRoot)) return filePath
-    const rel = path.relative(repoRoot, filePath)
-    return path.join(worktreePath, rel)
-}
-function escapeRegex(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
-function repoRootRegex(repoRoot) {
-    const fwd = norm(repoRoot)
-    const back = fwd.replace(/\//g, "\\\\")
-    return new RegExp(escapeRegex(fwd) + "|" + escapeRegex(back), "gi")
-}
-function defaultBaseBranch(repoRoot) {
-    const r = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoRoot)
-    if (r.ok) {
-        const m = r.stdout.trim().match(/^origin\/(.+)$/)
-        if (m) return m[1]
-    }
-    const head = git(["symbolic-ref", "--short", "HEAD"], repoRoot)
-    return head.ok ? head.stdout.trim() : null
-}
-function validateBranch(name) {
-    if (!name || typeof name !== "string") throw new Error("branch name is required")
-    if (name.length > 255) throw new Error("branch name too long")
-    if (name.startsWith("-")) throw new Error("branch cannot start with '-'")
-    if (name.startsWith("/") || name.endsWith("/")) throw new Error("branch cannot start or end with '/'")
-    if (name.includes("//")) throw new Error("branch cannot contain '//'")
-    if (name.includes("..")) throw new Error("branch cannot contain '..'")
-    if (name.includes("@{")) throw new Error("branch cannot contain '@{'")
-    if (name.endsWith(".lock")) throw new Error("branch cannot end with '.lock'")
-    if (BRANCH_INVALID_CHARS.test(name)) throw new Error("branch contains invalid characters")
-    if (/[\x00-\x1f\x7f]/.test(name)) throw new Error("branch contains control characters")
-    if (name.includes(" ")) throw new Error("branch cannot contain spaces")
-    return name
-}
-function slugify(title) {
-    return (
-        title
-            .toLowerCase()
-            .trim()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "")
-            .slice(0, 60) || "task"
-    )
-}
-function loadConfig(repoRoot) {
-    const cfg = {
-        branchPrefix: "wt/",
-        baseBranch: null,
-        worktreeRoot: null,
-        protectedBranches: [],
-        sync: { copyFiles: [], symlinkDirs: [] },
-        hooks: { postCreate: [], preDelete: [] },
-    }
-    const p = path.join(repoRoot, ".opencode", "worktree-workflow.json")
-    if (!existsSync(p)) return cfg
-    try {
-        const parsed = JSON.parse(readFileSync(p, "utf8"))
-        return {
-            ...cfg,
-            ...parsed,
-            sync: { ...cfg.sync, ...(parsed.sync || {}) },
-            hooks: { ...cfg.hooks, ...(parsed.hooks || {}) },
-        }
-    } catch {
-        return cfg
-    }
-}
-function resolveWorktreeRoot(raw, repoRoot) {
-    return raw
-        ? raw
-              .replace(/\$REPO/g, repoRoot)
-              .replace(/\$HOME/g, homedir())
-              .replace(/^~(?=$|[\\/])/, homedir())
-        : DEFAULT_WORKTREE_ROOT
-}
-function runHookCommands(commands, cwd) {
-    for (const cmd of commands) {
-        if (IS_WIN) spawnSync("cmd", ["/d", "/c", cmd], { cwd, stdio: "ignore" })
-        else spawnSync("bash", ["-c", cmd], { cwd, stdio: "ignore" })
-    }
-}
-function stateFilePath(projectId) {
-    return path.join(STATE_DIR, `${projectId}.json`)
-}
-function loadState(projectId) {
-    const p = stateFilePath(projectId)
-    if (!existsSync(p)) return { sessions: {} }
-    try {
-        const parsed = JSON.parse(readFileSync(p, "utf8"))
-        if (!parsed.sessions || typeof parsed.sessions !== "object") parsed.sessions = {}
-        return parsed
-    } catch {
-        return { sessions: {} }
-    }
-}
-function saveState(projectId, state) {
-    mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(stateFilePath(projectId), JSON.stringify(state, null, 2))
-}
 
 const WorktreePlugin = async (ctx) => {
     const repoRoot = ctx.directory
@@ -514,60 +380,7 @@ const WorktreePlugin = async (ctx) => {
             if (!args || typeof args !== "object") return
             const binding = await resolveBinding(sessionId)
             if (!binding) return
-            const R = binding.repoRoot
-            const W = binding.path
-            try {
-                switch (toolName) {
-                    case "write":
-                    case "edit":
-                    case "read": {
-                        const fp = args.filePath
-                        if (typeof fp !== "string") return
-                        if (norm(fp).includes("/.git")) {
-                            throw new Error(`[worktree] access to .git paths is blocked: ${fp}`)
-                        }
-                        const rewritten = rewritesToWorktree(fp, R, W)
-                        if (rewritten !== fp) args.filePath = rewritten
-                        return
-                    }
-                    case "glob":
-                    case "grep": {
-                        const p = args.path
-                        if (!p || typeof p !== "string") {
-                            args.path = W
-                            return
-                        }
-                        if (norm(p).includes("/.git")) {
-                            throw new Error(`[worktree] access to .git paths is blocked: ${p}`)
-                        }
-                        const rewritten = rewritesToWorktree(p, R, W)
-                        if (rewritten !== p) args.path = rewritten
-                        return
-                    }
-                    case "bash": {
-                        if (args.workdir === undefined && args.cwd === undefined) {
-                            args.workdir = W
-                        }
-                        const cmd = args.command
-                        if (typeof cmd !== "string") return
-                        if (repoRootRegex(R).test(cmd)) {
-                            args.command = cmd.replace(repoRootRegex(R), () => W)
-                            if (repoRootRegex(R).test(args.command)) {
-                                throw new Error(
-                                    `[worktree] bash command references the repo root in a form that cannot be ` +
-                                        `safely rewritten to the worktree. Refactor the command to avoid the ` +
-                                        `absolute repo path: ${args.command}`,
-                                )
-                            }
-                        }
-                        return
-                    }
-                    default:
-                        return
-                }
-            } catch (e) {
-                throw e
-            }
+            applyInterception(toolName, args, binding.repoRoot, binding.path)
         },
 
         "experimental.chat.system.transform": async (input, output) => {
