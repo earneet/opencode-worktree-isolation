@@ -33,6 +33,7 @@ test("setup: create a temp git repo with a base commit", () => {
     assert.ok(git(["init"], repoDir).ok, "git init")
     assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
     assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
+    assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
     writeFileSync(path.join(repoDir, "README.md"), "# test repo\n")
     assert.ok(git(["add", "README.md"], repoDir).ok)
     assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
@@ -108,7 +109,7 @@ test("worktree_merge apply merges work, removes worktree, deletes branch, unbind
     assert.ok(result.startsWith("✅"), `merge should succeed, got: ${result}`)
 
     assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merged file should be in repo root")
-    assert.equal(readFileSync(path.join(repoDir, "feature.txt"), "utf8"), "feature work\n")
+    assert.equal(readFileSync(path.join(repoDir, "feature.txt"), "utf8").replace(/\r\n/g, "\n"), "feature work\n")
 
     assert.ok(!existsSync(worktreePath), "worktree dir should be removed")
 
