@@ -16,30 +16,80 @@ export const IS_WIN = process.platform === "win32"
 export const MAX_PARENT_DEPTH = 10
 export const BRANCH_INVALID_CHARS = /[~^:?*[\]\\]/
 
-export function getDefaultWorktreeRoot() {
+export interface GitResult {
+    ok: boolean
+    stdout: string
+    stderr: string
+}
+
+export interface SessionBinding {
+    branch: string
+    path: string
+    repoRoot: string
+    title: string
+    createdAt: string
+    inherited?: boolean
+    _state?: WorktreeState
+}
+
+export interface WorktreeState {
+    sessions: Record<string, SessionBinding>
+}
+
+export interface SyncConfig {
+    copyFiles: string[]
+    symlinkDirs: string[]
+}
+
+export interface HooksConfig {
+    postCreate: string[]
+    preDelete: string[]
+}
+
+export interface WorktreeConfig {
+    branchPrefix: string
+    baseBranch: string | null
+    worktreeRoot: string | null
+    protectedBranches: string[]
+    sync: SyncConfig
+    hooks: HooksConfig
+}
+
+export interface MutableToolArgs {
+    filePath?: string
+    path?: string
+    command?: string
+    workdir?: string
+    cwd?: string
+    [key: string]: unknown
+}
+
+export function getDefaultWorktreeRoot(): string {
     return (
         process.env.OC_WT_ROOT ||
         path.join(homedir(), ".local", "share", "opencode", "worktree")
     )
 }
-export function getStateDir() {
+
+export function getStateDir(): string {
     return (
         process.env.OC_WT_STATE_DIR ||
         path.join(homedir(), ".local", "share", "opencode", "worktree-workflow")
     )
 }
 
-export function git(args, cwd) {
+export function git(args: string[], cwd: string): GitResult {
     const r = spawnSync("git", args, { cwd, encoding: "utf8" })
     if (r.error) return { ok: false, stdout: "", stderr: String(r.error) }
     if (r.status !== 0) return { ok: false, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
     return { ok: true, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
 }
 
-const projectIdCache = new Map()
-export function computeProjectId(repoRoot) {
-    if (projectIdCache.has(repoRoot)) return projectIdCache.get(repoRoot)
-    let id = null
+const projectIdCache = new Map<string, string>()
+
+export function computeProjectId(repoRoot: string): string {
+    if (projectIdCache.has(repoRoot)) return projectIdCache.get(repoRoot)!
+    let id: string | null = null
     const r = git(["rev-list", "--max-parents=0", "--all"], repoRoot)
     if (r.ok) {
         const roots = r.stdout
@@ -47,45 +97,51 @@ export function computeProjectId(repoRoot) {
             .map((s) => s.trim())
             .filter(Boolean)
             .sort()
-        if (roots.length && /^[a-f0-9]{40}$/i.test(roots[0])) id = roots[0]
+        if (roots.length && /^[a-f0-9]{40}$/i.test(roots[0]!)) id = roots[0]
     }
     if (!id) id = createHash("sha256").update(repoRoot).digest("hex").slice(0, 16)
     projectIdCache.set(repoRoot, id)
     return id
 }
 
-export function norm(p) {
+export function norm(p: string): string {
     return path.resolve(p).replace(/\\/g, "/").toLowerCase()
 }
-export function isInside(p, base) {
+
+export function isInside(p: string, base: string): boolean {
     const np = norm(p)
     const nb = norm(base)
     return np === nb || np.startsWith(nb + "/")
 }
-export function rewritesToWorktree(filePath, repoRoot, worktreePath) {
+
+export function rewritesToWorktree(filePath: string, repoRoot: string, worktreePath: string): string {
     if (isInside(filePath, worktreePath)) return filePath
     if (!isInside(filePath, repoRoot)) return filePath
     const rel = path.relative(repoRoot, filePath)
     return path.join(worktreePath, rel)
 }
-export function escapeRegex(s) {
+
+export function escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
-export function repoRootRegex(repoRoot) {
+
+export function repoRootRegex(repoRoot: string): RegExp {
     const fwd = norm(repoRoot)
     const back = fwd.replace(/\//g, "\\")
     return new RegExp(escapeRegex(fwd) + "|" + escapeRegex(back), "gi")
 }
-export function defaultBaseBranch(repoRoot) {
+
+export function defaultBaseBranch(repoRoot: string): string | null {
     const r = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoRoot)
     if (r.ok) {
         const m = r.stdout.trim().match(/^origin\/(.+)$/)
-        if (m) return m[1]
+        if (m) return m[1]!
     }
     const head = git(["symbolic-ref", "--short", "HEAD"], repoRoot)
     return head.ok ? head.stdout.trim() : null
 }
-export function validateBranch(name) {
+
+export function validateBranch(name: string): string {
     if (!name || typeof name !== "string") throw new Error("branch name is required")
     if (name.length > 255) throw new Error("branch name too long")
     if (name.startsWith("-")) throw new Error("branch cannot start with '-'")
@@ -99,7 +155,8 @@ export function validateBranch(name) {
     if (name.includes(" ")) throw new Error("branch cannot contain spaces")
     return name
 }
-export function slugify(title) {
+
+export function slugify(title: string): string {
     return (
         title
             .toLowerCase()
@@ -109,8 +166,9 @@ export function slugify(title) {
             .slice(0, 60) || "task"
     )
 }
-export function loadConfig(repoRoot) {
-    const cfg = {
+
+export function loadConfig(repoRoot: string): WorktreeConfig {
+    const cfg: WorktreeConfig = {
         branchPrefix: "wt/",
         baseBranch: null,
         worktreeRoot: null,
@@ -121,18 +179,22 @@ export function loadConfig(repoRoot) {
     const p = path.join(repoRoot, ".opencode", "worktree-workflow.json")
     if (!existsSync(p)) return cfg
     try {
-        const parsed = JSON.parse(readFileSync(p, "utf8"))
-        return {
-            ...cfg,
-            ...parsed,
-            sync: { ...cfg.sync, ...(parsed.sync || {}) },
-            hooks: { ...cfg.hooks, ...(parsed.hooks || {}) },
+        const parsed = JSON.parse(readFileSync(p, "utf8")) as Partial<WorktreeConfig>
+        const merged: WorktreeConfig = {
+            branchPrefix: parsed.branchPrefix ?? cfg.branchPrefix,
+            baseBranch: parsed.baseBranch !== undefined ? parsed.baseBranch : cfg.baseBranch,
+            worktreeRoot: parsed.worktreeRoot !== undefined ? parsed.worktreeRoot : cfg.worktreeRoot,
+            protectedBranches: parsed.protectedBranches ?? cfg.protectedBranches,
+            sync: { copyFiles: parsed.sync?.copyFiles ?? cfg.sync.copyFiles, symlinkDirs: parsed.sync?.symlinkDirs ?? cfg.sync.symlinkDirs },
+            hooks: { postCreate: parsed.hooks?.postCreate ?? cfg.hooks.postCreate, preDelete: parsed.hooks?.preDelete ?? cfg.hooks.preDelete },
         }
+        return merged
     } catch {
         return cfg
     }
 }
-export function resolveWorktreeRoot(raw, repoRoot) {
+
+export function resolveWorktreeRoot(raw: string | null | undefined, repoRoot: string): string {
     return raw
         ? raw
               .replace(/\$REPO/g, repoRoot)
@@ -140,32 +202,41 @@ export function resolveWorktreeRoot(raw, repoRoot) {
               .replace(/^~(?=$|[\\/])/, homedir())
         : getDefaultWorktreeRoot()
 }
-export function runHookCommands(commands, cwd) {
+
+export function runHookCommands(commands: string[], cwd: string): void {
     for (const cmd of commands) {
         if (IS_WIN) spawnSync("cmd", ["/d", "/c", cmd], { cwd, stdio: "ignore" })
         else spawnSync("bash", ["-c", cmd], { cwd, stdio: "ignore" })
     }
 }
-export function stateFilePath(projectId) {
+
+export function stateFilePath(projectId: string): string {
     return path.join(getStateDir(), `${projectId}.json`)
 }
-export function loadState(projectId) {
+
+export function loadState(projectId: string): WorktreeState {
     const p = stateFilePath(projectId)
     if (!existsSync(p)) return { sessions: {} }
     try {
-        const parsed = JSON.parse(readFileSync(p, "utf8"))
+        const parsed = JSON.parse(readFileSync(p, "utf8")) as WorktreeState
         if (!parsed.sessions || typeof parsed.sessions !== "object") parsed.sessions = {}
         return parsed
     } catch {
         return { sessions: {} }
     }
 }
-export function saveState(projectId, state) {
+
+export function saveState(projectId: string, state: WorktreeState): void {
     mkdirSync(getStateDir(), { recursive: true })
     writeFileSync(stateFilePath(projectId), JSON.stringify(state, null, 2))
 }
 
-export function applyInterception(toolName, args, repoRoot, worktreePath) {
+export function applyInterception(
+    toolName: string,
+    args: MutableToolArgs,
+    repoRoot: string,
+    worktreePath: string,
+): void {
     switch (toolName) {
         case "write":
         case "edit":

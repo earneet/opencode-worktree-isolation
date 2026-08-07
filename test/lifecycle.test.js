@@ -3,8 +3,8 @@ import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
-import WorktreePlugin from "../index.js"
-import { git, computeProjectId, loadState } from "../lib.js"
+import WorktreePlugin from "../dist/index.js"
+import { git, computeProjectId, loadState } from "../dist/lib.js"
 
 const testRoot = mkdtempSync(path.join(tmpdir(), "ocwt-lifecycle-"))
 const repoDir = path.join(testRoot, "repo")

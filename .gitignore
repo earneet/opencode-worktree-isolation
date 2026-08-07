@@ -1,2 +1,3 @@
 node_modules/
 .opencode/worktree-workflow.json
+dist/

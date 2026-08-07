@@ -1,12 +1,16 @@
 {
     "name": "opencode-worktree-guard",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "description": "opencode plugin that eliminates path drift via tool-layer worktree interception",
     "type": "module",
-    "main": "index.js",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
     "license": "MIT",
     "scripts": {
-        "test": "node --test test/unit.test.js test/lifecycle.test.js"
+        "build": "tsc",
+        "prepare": "tsc",
+        "typecheck": "tsc --noEmit",
+        "test": "npm run build && node --test test/unit.test.js test/lifecycle.test.js"
     },
     "keywords": [
         "opencode",
@@ -19,5 +23,9 @@
     "dependencies": {
         "@opencode-ai/plugin": "1.17.4",
         "zod": "^3.23.8"
+    },
+    "devDependencies": {
+        "@types/node": "^26.1.2",
+        "typescript": "^7.0.2"
     }
 }

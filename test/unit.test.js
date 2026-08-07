@@ -11,7 +11,7 @@ import {
     repoRootRegex,
     resolveWorktreeRoot,
     escapeRegex,
-} from "../lib.js"
+} from "../dist/lib.js"
 
 const REPO = "C:/test/repo"
 const WT = "C:/test/wt/abc123/wt-task"

@@ -1,5 +1,5 @@
 import * as path from "node:path"
-import { tool } from "@opencode-ai/plugin"
+import { tool, type Plugin } from "@opencode-ai/plugin"
 import {
     IS_WIN,
     MAX_PARENT_DEPTH,
@@ -20,34 +20,38 @@ import {
     statSync,
     symlinkSync,
 } from "./lib.js"
+import type { MutableToolArgs, SessionBinding, WorktreeState } from "./lib.js"
 
 const z = tool.schema
 
-const WorktreePlugin = async (ctx) => {
+const WorktreePlugin: Plugin = async (ctx) => {
     const repoRoot = ctx.directory
     const client = ctx.client
-    let pidCache = null
-    const getPid = () => (pidCache ??= computeProjectId(repoRoot))
+    let pidCache: string | null = null
+    const getPid = (): string => (pidCache ??= computeProjectId(repoRoot))
 
-    const inheritCache = new Map()
-    async function resolveBinding(sessionId) {
+    const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
+
+    async function resolveBinding(
+        sessionId: string,
+    ): Promise<(SessionBinding & { _state?: WorktreeState }) | null> {
         if (!sessionId) return null
         const state = loadState(getPid())
-        if (state.sessions[sessionId]) return { ...state.sessions[sessionId], _state: state }
-        if (inheritCache.has(sessionId)) return inheritCache.get(sessionId)
+        if (state.sessions[sessionId]) return { ...state.sessions[sessionId]!, _state: state }
+        if (inheritCache.has(sessionId)) return inheritCache.get(sessionId)!
         let current = sessionId
-        let found = null
+        let found: SessionBinding | null = null
         for (let i = 0; i < MAX_PARENT_DEPTH; i++) {
-            let parentId
+            let parentId: string | undefined
             try {
                 const res = await client.session.get({ path: { id: current } })
-                parentId = res.data?.parentID
+                parentId = res.data?.parentID ?? undefined
             } catch {
                 break
             }
             if (!parentId) break
             if (state.sessions[parentId]) {
-                found = state.sessions[parentId]
+                found = state.sessions[parentId]!
                 break
             }
             current = parentId
@@ -63,7 +67,7 @@ const WorktreePlugin = async (ctx) => {
                 inherited: true,
             }
             saveState(getPid(), state2)
-            const result = { ...state2.sessions[sessionId], _state: state2 }
+            const result = { ...state2.sessions[sessionId]!, _state: state2 }
             inheritCache.set(sessionId, result)
             return result
         }
@@ -95,13 +99,13 @@ const WorktreePlugin = async (ctx) => {
                     const pid = computeProjectId(R)
                     const cfg = loadConfig(R)
                     const title = (args.title || "").trim()
-                    let branch
+                    let branch: string
                     try {
                         branch = args.branch
                             ? validateBranch(args.branch)
                             : validateBranch((cfg.branchPrefix || "wt/") + slugify(title))
                     } catch (e) {
-                        return `❌ ${e.message}`
+                        return `❌ ${(e as Error).message}`
                     }
                     const base = args.baseBranch || cfg.baseBranch || defaultBaseBranch(R)
                     const wRoot = resolveWorktreeRoot(cfg.worktreeRoot, R)
@@ -109,7 +113,9 @@ const WorktreePlugin = async (ctx) => {
                     const existsAlready = git(["rev-parse", "--verify", branch], R).ok
                     const addArgs = existsAlready
                         ? ["worktree", "add", W, branch]
-                        : ["worktree", "add", "-b", branch, W, base].filter((x) => x !== null && x !== undefined)
+                        : ["worktree", "add", "-b", branch, W, base].filter(
+                              (x): x is string => x !== null && x !== undefined,
+                          )
                     mkdirSync(path.dirname(W), { recursive: true })
                     const addResult = git(addArgs, R)
                     if (!addResult.ok) {
@@ -213,8 +219,8 @@ const WorktreePlugin = async (ctx) => {
                             `Only merged branches are removed unless force=true.`
                         )
                     }
-                    const removed = []
-                    const skipped = []
+                    const removed: string[] = []
+                    const skipped: string[] = []
                     for (const [sid, b] of entries) {
                         if (cfg.protectedBranches.includes(b.branch)) {
                             skipped.push(`  🔒 ${b.branch}: protected`)
@@ -274,7 +280,7 @@ const WorktreePlugin = async (ctx) => {
                     const state = loadState(pid)
 
                     let branch = args.branch
-                    let boundSid = null
+                    let boundSid: string | null = null
                     if (!branch) {
                         const binding = state.sessions[tctx.sessionID]
                         if (!binding)
@@ -376,7 +382,7 @@ const WorktreePlugin = async (ctx) => {
             const toolName = input?.tool
             if (!sessionId || !output || typeof toolName !== "string") return
             if (toolName.startsWith("worktree_")) return
-            const args = output.args
+            const args = output.args as MutableToolArgs
             if (!args || typeof args !== "object") return
             const binding = await resolveBinding(sessionId)
             if (!binding) return

@@ -61,7 +61,7 @@ Then register with an absolute path:
 {
     "$schema": "https://opencode.ai/config.json",
     "plugin": [
-        "/absolute/path/to/opencode-worktree-guard/index.js"
+        "/absolute/path/to/opencode-worktree-guard/dist/index.js"
     ]
 }
 ```
@@ -179,6 +179,12 @@ npm test
 
 - **Unit tests** (`test/unit.test.js`): path normalization/containment/rewriting, branch-name validation (option/path-traversal injection), slugify, and the `applyInterception` logic for every intercepted tool (write/edit/read/glob/grep/bash), including `.git` blocking and bash repo-root replacement.
 - **Integration tests** (`test/lifecycle.test.js`): full lifecycle against a real temporary git repo — prepare → interception → merge preview/apply → cleanup — with state and worktree directories isolated via `OC_WT_STATE_DIR` / `OC_WT_ROOT` env vars.
+
+## TypeScript
+
+The plugin source is written in TypeScript (`src/`) and compiled to `dist/` via `tsc`. The `prepare` npm lifecycle hook auto-builds on `npm install`, so git URL consumers get the compiled output automatically. For local clone users, run `npm run build` after installing.
+
+Type checking (without emitting): `npm run typecheck`.
 
 ## Design
 
