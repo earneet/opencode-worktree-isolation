@@ -1,0 +1,20 @@
+{
+    "name": "opencode-worktree-guard",
+    "version": "0.1.0",
+    "description": "opencode plugin that eliminates path drift via tool-layer worktree interception",
+    "type": "module",
+    "main": "src/index.js",
+    "license": "MIT",
+    "keywords": [
+        "opencode",
+        "opencode-plugin",
+        "git",
+        "worktree",
+        "path-drift",
+        "isolation"
+    ],
+    "dependencies": {
+        "@opencode-ai/plugin": "1.17.4",
+        "zod": "^3.23.8"
+    }
+}

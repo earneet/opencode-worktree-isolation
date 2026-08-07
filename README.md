@@ -1,0 +1,149 @@
+# opencode-worktree-guard
+
+> Eliminate path drift in [opencode](https://opencode.ai) with tool-layer worktree interception.
+
+## The Problem
+
+When an AI coding agent works on a task in your repository, it needs to write files in the right place. Without isolation, parallel agents stomp on each other's changes. With git worktrees, each agent gets its own working directory — but existing solutions either spawn separate processes (losing conversation context) or rely on the agent remembering to `cd` (path drift).
+
+**Path drift** is when the agent thinks it's writing to the worktree but actually writes to the repo root — or vice versa. It's the #1 frustration with worktree-based workflows.
+
+## The Solution
+
+This plugin uses opencode's `tool.execute.before` hook to **transparently rewrite file paths** at the tool layer. When a session is bound to a worktree, every `write`/`edit`/`read`/`glob`/`grep`/`bash` call is automatically routed to the worktree directory. The agent doesn't need to remember anything — the plugin handles it.
+
+### Dual-Layer Defense
+
+1. **System prompt (primary)**: When a session enters a worktree, the plugin injects an authoritative system prompt telling the agent its working directory has changed. The agent naturally generates worktree-relative paths.
+
+2. **Path rewriting (safety net)**: If the agent occasionally generates a repo-root path out of habit, the `tool.execute.before` hook silently rewrites it to the worktree. The agent never notices.
+
+This combines the best of both worlds: the agent's primary behavior is correct (it knows it's in a worktree), and the rare mistakes are caught by hard enforcement.
+
+## Installation
+
+### Requirements
+
+- [opencode](https://opencode.ai) v1.18+
+- git 2.5+
+- Node.js 20+ or Bun
+
+### Setup
+
+1. Clone this repo somewhere stable:
+
+```bash
+git clone https://github.com/earneet/opencode-worktree-guard.git
+cd opencode-worktree-guard
+npm install
+```
+
+2. Register the plugin in your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
+
+```json
+{
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": [
+        "/absolute/path/to/opencode-worktree-guard/src/index.js"
+    ]
+}
+```
+
+Or for project-local use, copy `src/index.js` and `package.json` into your project and reference the relative path.
+
+## Usage
+
+### Create a worktree
+
+Ask the agent to call `worktree_prepare`, or use it directly:
+
+```
+worktree_prepare(title="fix authentication bug")
+```
+
+This creates a git worktree, binds the current session to it, and from this point on, all file operations are routed to the worktree.
+
+### Work normally
+
+After `worktree_prepare`, just use file tools as usual. Writes, edits, reads, globs, greps, and bash commands all land in the worktree automatically. The agent knows it's in the worktree (via system prompt) and generates correct paths.
+
+### Clean up
+
+When the task is done:
+
+```
+worktree_cleanup(action="preview")                    // see what's ready to clean
+worktree_cleanup(action="apply", branch="wt/fix-auth") // remove a specific worktree
+worktree_cleanup(action="apply")                       // remove all merged worktrees
+```
+
+Cleanup only removes worktrees whose branches are merged into the base branch (unless `force=true`).
+
+## Configuration
+
+Optional sidecar config at `.opencode/worktree-workflow.json` in your repo root:
+
+```json
+{
+    "branchPrefix": "wt/",
+    "baseBranch": null,
+    "worktreeRoot": null,
+    "protectedBranches": [],
+    "sync": {
+        "copyFiles": [".env"],
+        "symlinkDirs": ["node_modules"]
+    },
+    "hooks": {
+        "postCreate": ["npm install"],
+        "preDelete": []
+    }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `branchPrefix` | `"wt/"` | Prefix for generated branch names |
+| `baseBranch` | `null` (auto-detect) | Base branch for new worktrees |
+| `worktreeRoot` | `~/.local/share/opencode/worktree` | Root directory for worktrees. Supports `$REPO`, `$HOME` |
+| `protectedBranches` | `[]` | Branches that cleanup will never remove |
+| `sync.copyFiles` | `[]` | Files to copy from repo root into new worktrees |
+| `sync.symlinkDirs` | `[]` | Directories to symlink (junction on Windows) |
+| `hooks.postCreate` | `[]` | Shell commands to run after worktree creation |
+| `hooks.preDelete` | `[]` | Shell commands to run before worktree removal |
+
+## How It Works
+
+### Interception Rules
+
+When a session is bound to a worktree (path `W`, repo root `R`):
+
+| Tool | Behavior |
+|------|----------|
+| `write` / `edit` / `read` | Absolute paths under `R` are rewritten to `W`. Paths under `R/.git` are blocked. |
+| `glob` / `grep` | Missing `path` is set to `W`. Paths under `R` are rewritten to `W`. |
+| `bash` | Missing `workdir` is set to `W`. Repo-root paths in the command string are replaced with `W`. |
+| `task` (subagents) | Subagent sessions inherit the binding via parent-chain traversal. |
+
+### Subagent Inheritance
+
+When a bound session spawns subagents via `task()`, the subagent's session automatically inherits the worktree binding. This is done via lazy parent-chain traversal: on the subagent's first tool call, the plugin walks the `parentID` chain to find an ancestor with a binding, then copies that binding to the subagent.
+
+### Windows Support
+
+- Path comparisons are case-insensitive with separator normalization
+- `symlinkDirs` uses junctions on Windows (no admin privileges needed)
+- Hooks run via `cmd /d /c` on Windows, `bash -c` elsewhere
+
+## Limitations
+
+- **No TUI indicator**: opencode 1.18's plugin API doesn't support dynamic session title/metadata updates, so the worktree branch isn't visible in the status bar. The agent's responses will mention the worktree context.
+- **Single worktree per session**: A session can be bound to one worktree at a time. For true parallel work, use separate opencode sessions.
+- **Bash path replacement is string-based**: Complex command strings with unusual path formats (8.3 short names, mixed separators) may not be fully rewritten. The plugin blocks commands where residual repo-root paths are detected after replacement.
+
+## Design
+
+See [docs/design.md](docs/design.md) for the full design document, including contract evidence, interception rule derivation, and the probe-based methodology used to verify the opencode plugin runtime contract.
+
+## License
+
+MIT
