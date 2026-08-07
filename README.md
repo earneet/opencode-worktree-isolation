@@ -30,7 +30,22 @@ This combines the best of both worlds: the agent's primary behavior is correct (
 
 ### Setup
 
-1. Clone this repo somewhere stable:
+**Option A: Git URL (recommended — auto-installs on opencode startup)**
+
+Add the plugin to your `opencode.json` (project-level or global `~/.config/opencode/opencode.json`):
+
+```json
+{
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": [
+        "opencode-worktree-guard@git+https://github.com/earneet/opencode-worktree-guard.git"
+    ]
+}
+```
+
+opencode automatically clones the repo and installs dependencies on startup. No manual steps needed.
+
+**Option B: Local clone**
 
 ```bash
 git clone https://github.com/earneet/opencode-worktree-guard.git
@@ -38,7 +53,7 @@ cd opencode-worktree-guard
 npm install
 ```
 
-2. Register the plugin in your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
+Then register with an absolute path:
 
 ```json
 {
@@ -48,8 +63,6 @@ npm install
     ]
 }
 ```
-
-Or for project-local use, copy `src/index.js` and `package.json` into your project and reference the relative path.
 
 ## Usage
 
