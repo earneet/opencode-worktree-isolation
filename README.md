@@ -1,5 +1,7 @@
 # opencode-worktree-guard
 
+![CI](https://github.com/earneet/opencode-worktree-guard/actions/workflows/ci.yml/badge.svg)
+
 > Eliminate path drift in [opencode](https://opencode.ai) with tool-layer worktree interception.
 
 ## The Problem
