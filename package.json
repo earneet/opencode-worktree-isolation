@@ -1,6 +1,6 @@
 {
-    "name": "opencode-worktree-guard",
-    "version": "0.3.0",
+    "name": "opencode-worktree-isolation",
+    "version": "0.3.1",
     "description": "opencode plugin that eliminates path drift via tool-layer worktree interception",
     "type": "module",
     "main": "dist/index.js",

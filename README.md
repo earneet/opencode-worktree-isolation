@@ -1,6 +1,6 @@
-# opencode-worktree-guard
+# opencode-worktree-isolation
 
-![CI](https://github.com/earneet/opencode-worktree-guard/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/earneet/opencode-worktree-isolation/actions/workflows/ci.yml/badge.svg)
 
 > Eliminate path drift in [opencode](https://opencode.ai) with tool-layer worktree interception.
 
@@ -40,7 +40,7 @@ Add the plugin to your `opencode.json` (project-level or global `~/.config/openc
 {
     "$schema": "https://opencode.ai/config.json",
     "plugin": [
-        "opencode-worktree-guard@git+https://github.com/earneet/opencode-worktree-guard.git"
+        "opencode-worktree-isolation@git+https://github.com/earneet/opencode-worktree-isolation.git"
     ]
 }
 ```
@@ -50,8 +50,8 @@ opencode automatically clones the repo and installs dependencies on startup. No 
 **Option B: Local clone**
 
 ```bash
-git clone https://github.com/earneet/opencode-worktree-guard.git
-cd opencode-worktree-guard
+git clone https://github.com/earneet/opencode-worktree-isolation.git
+cd opencode-worktree-isolation
 npm install
 ```
 
@@ -61,7 +61,7 @@ Then register with an absolute path:
 {
     "$schema": "https://opencode.ai/config.json",
     "plugin": [
-        "/absolute/path/to/opencode-worktree-guard/dist/index.js"
+        "/absolute/path/to/opencode-worktree-isolation/dist/index.js"
     ]
 }
 ```
