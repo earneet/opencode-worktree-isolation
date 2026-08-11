@@ -1,3 +1,4 @@
 node_modules/
 .opencode/worktree-workflow.json
+.omo/run-continuation/
 dist/

@@ -8,19 +8,20 @@ import {
     validateBranch,
     slugify,
     loadConfig,
+    createStateBackend,
     resolveWorktreeRoot,
     defaultBaseBranch,
     runHookCommands,
-    loadState,
-    saveState,
+    removeSyncedLinks,
     applyInterception,
+    isAllowlisted,
     existsSync,
     mkdirSync,
     copyFileSync,
     statSync,
     symlinkSync,
 } from "./lib.js"
-import type { MutableToolArgs, SessionBinding, WorktreeState } from "./lib.js"
+import type { DecisionContext, MutableToolArgs, SessionBinding, WorktreeState } from "./lib.js"
 
 const z = tool.schema
 
@@ -30,14 +31,17 @@ const WorktreePlugin: Plugin = async (ctx) => {
     let pidCache: string | null = null
     const getPid = (): string => (pidCache ??= computeProjectId(repoRoot))
 
+    const cfg = loadConfig(repoRoot)
+    const stateBackend = createStateBackend(repoRoot, cfg)
+
     const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
 
     async function resolveBinding(
         sessionId: string,
     ): Promise<(SessionBinding & { _state?: WorktreeState }) | null> {
         if (!sessionId) return null
-        const state = loadState(getPid())
-        if (state.sessions[sessionId]) return { ...state.sessions[sessionId]!, _state: state }
+        const direct = stateBackend.loadBinding(sessionId)
+        if (direct) return { ...direct, _state: stateBackend.loadAll() }
         if (inheritCache.has(sessionId)) return inheritCache.get(sessionId)!
         let current = sessionId
         let found: SessionBinding | null = null
@@ -50,15 +54,15 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 break
             }
             if (!parentId) break
-            if (state.sessions[parentId]) {
-                found = state.sessions[parentId]!
+            const inherited = stateBackend.loadBinding(parentId)
+            if (inherited) {
+                found = inherited
                 break
             }
             current = parentId
         }
         if (found) {
-            const state2 = loadState(getPid())
-            state2.sessions[sessionId] = {
+            const snapshot: SessionBinding = {
                 branch: found.branch,
                 path: found.path,
                 repoRoot: found.repoRoot,
@@ -66,8 +70,8 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 createdAt: new Date().toISOString(),
                 inherited: true,
             }
-            saveState(getPid(), state2)
-            const result = { ...state2.sessions[sessionId]!, _state: state2 }
+            stateBackend.saveBinding(sessionId, snapshot)
+            const result = { ...snapshot, _state: stateBackend.loadAll() }
             inheritCache.set(sessionId, result)
             return result
         }
@@ -97,7 +101,6 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 async execute(args, tctx) {
                     const R = tctx.directory
                     const pid = computeProjectId(R)
-                    const cfg = loadConfig(R)
                     const title = (args.title || "").trim()
                     let branch: string
                     try {
@@ -146,15 +149,19 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         }
                     }
                     runHookCommands(cfg.hooks.postCreate || [], W)
-                    const state = loadState(pid)
-                    state.sessions[tctx.sessionID] = {
+                    stateBackend.saveBinding(tctx.sessionID, {
                         branch,
                         path: W,
                         repoRoot: R,
                         title,
                         createdAt: new Date().toISOString(),
-                    }
-                    saveState(pid, state)
+                    })
+                    stateBackend.appendAudit({
+                        type: "prepare",
+                        sessionId: tctx.sessionID,
+                        branch,
+                        path: W,
+                    })
                     try {
                         tctx.metadata({
                             title: `🌿 ${branch}`,
@@ -191,9 +198,7 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 },
                 async execute(args, tctx) {
                     const R = tctx.directory
-                    const pid = computeProjectId(R)
-                    const cfg = loadConfig(R)
-                    const state = loadState(pid)
+                    const state = stateBackend.loadAll()
                     const entries = Object.entries(state.sessions)
                     if (!entries.length) return "No worktrees are currently bound to this project."
                     const base = cfg.baseBranch || defaultBaseBranch(R)
@@ -239,7 +244,13 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             skipped.push(`  ⏭  ${b.branch}: unmerged (use force=true to remove)`)
                             continue
                         }
+                        const otherSessions = stateBackend.findSessionsForWorktree(b.path, sid)
+                        if (otherSessions.length > 0) {
+                            skipped.push(`  ⚠ ${b.branch}: 仍被其他会话绑定 (${otherSessions.join(", ")})，跳过删除`)
+                            continue
+                        }
                         runHookCommands(cfg.hooks.preDelete || [], b.path)
+                        removeSyncedLinks(b.path, cfg.sync.symlinkDirs || [])
                         git(["add", "-A"], b.path)
                         git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], b.path)
                         const rm = git(["worktree", "remove", "--force", b.path], R)
@@ -248,10 +259,15 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             continue
                         }
                         git(["branch", "-D", b.branch], R)
-                        delete state.sessions[sid]
+                        stateBackend.clearBinding(sid)
+                        stateBackend.appendAudit({
+                            type: "cleanup",
+                            sessionId: sid,
+                            branch: b.branch,
+                            reason: args.force ? "force" : "merged",
+                        })
                         removed.push(`  ✅ ${b.branch}: removed`)
                     }
-                    saveState(pid, state)
                     return (
                         `Cleanup apply complete.\n` +
                         (removed.length ? `Removed:\n${removed.join("\n")}\n` : "Removed: (none)\n") +
@@ -276,8 +292,7 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 },
                 async execute(args, tctx) {
                     const R = tctx.directory
-                    const pid = computeProjectId(R)
-                    const state = loadState(pid)
+                    const state = stateBackend.loadAll()
 
                     let branch = args.branch
                     let boundSid: string | null = null
@@ -337,6 +352,15 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             trackedChanges
                         )
                     }
+                    if (boundSid) {
+                        const otherSessions = stateBackend.findSessionsForWorktree(W, boundSid)
+                        if (otherSessions.length > 0) {
+                            return (
+                                `❌ Worktree "${branch}" 仍被其他会话绑定 (${otherSessions.join(", ")})。\n` +
+                                `请让那些会话先退出（worktree_cleanup 仅清理本会话绑定），或手动确认后用 force。`
+                            )
+                        }
+                    }
                     if (dirtyCount) {
                         git(["add", "-A"], W)
                         const c = git(["commit", "-m", "chore(worktree): pre-merge snapshot", "--allow-empty"], W)
@@ -352,6 +376,7 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         )
                     }
                     if (existsSync(W)) {
+                        removeSyncedLinks(W, cfg.sync.symlinkDirs || [])
                         const rm = git(["worktree", "remove", "--force", W], R)
                         if (!rm.ok) {
                             return (
@@ -363,15 +388,113 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         git(["worktree", "prune"], R)
                     }
                     git(["branch", "-d", branch], R)
-                    if (boundSid && state.sessions[boundSid]) {
-                        delete state.sessions[boundSid]
-                        saveState(pid, state)
+                    if (boundSid) {
+                        stateBackend.clearBinding(boundSid)
                     }
+                    stateBackend.appendAudit({
+                        type: "merge",
+                        sessionId: boundSid ?? tctx.sessionID,
+                        branch,
+                        target,
+                    })
                     return (
                         `✅ Merged "${branch}" into "${target}" and cleaned up.\n` +
                         `   worktree removed: ${W}\n` +
                         `   branch deleted:   ${branch}\n` +
                         `   session unbound — file operations now target the repo root (${R}) again.`
+                    )
+                },
+            }),
+
+            worktree_allow: tool({
+                description:
+                    "Temporarily allow writing to specific paths in the main checkout without a worktree binding. " +
+                    "Use for repo-level config/docs (e.g., AGENTS.md, CI configs). Entries have a TTL and are audited. " +
+                    "Requires strictWrites=true to be meaningful (otherwise all writes are allowed by default).",
+                args: {
+                    action: z
+                        .enum(["add", "list", "clear"])
+                        .describe("add = add a path; list = show current entries; clear = remove all entries"),
+                    path: z
+                        .string()
+                        .optional()
+                        .describe("For add: repo-relative path or glob pattern"),
+                    reason: z
+                        .string()
+                        .optional()
+                        .describe("For add: why this path needs main-checkout write"),
+                    ttlMinutes: z
+                        .number()
+                        .optional()
+                        .describe("TTL in minutes (default: 60, configurable via allowlistTtlMinutes)"),
+                },
+                async execute(args, tctx) {
+                    const R = tctx.directory
+                    if (args.action === "list") {
+                        const entries = stateBackend.loadAllowlist()
+                        if (entries.length === 0) return "Allowlist is empty."
+                        const lines = entries.map(
+                            (e) =>
+                                `  ${e.path.padEnd(40)} expires=${e.expiresAt ?? "(never)"} by=${e.bySession ?? "?"} reason="${e.reason ?? ""}"`,
+                        )
+                        return `Allowlist (${entries.length} entry):\n${lines.join("\n")}`
+                    }
+                    if (args.action === "clear") {
+                        const before = stateBackend.loadAllowlist().length
+                        stateBackend.saveAllowlist([])
+                        stateBackend.appendAudit({
+                            type: "allow_clear",
+                            sessionId: tctx.sessionID,
+                            removed: before,
+                        })
+                        return `✅ Allowlist cleared (removed ${before} entr${before === 1 ? "y" : "ies"}).`
+                    }
+                    const targetPath = (args.path || "").trim()
+                    if (!targetPath) {
+                        return `❌ path is required for action="add". Example: worktree_allow(action="add", path="AGENTS.md", reason="...").`
+                    }
+                    const dangerous = ["", ".", "/", ".git", "*", "**", "./", ".\\"]
+                    const slashStripped = targetPath.replace(/[/\\]/g, "")
+                    if (
+                        dangerous.includes(targetPath) ||
+                        [".git", "git"].includes(slashStripped) ||
+                        slashStripped === "*"
+                    ) {
+                        return (
+                            `❌ Refused to allow dangerous path: '${targetPath}'. ` +
+                            `Bare-root or wildcard patterns would disable worktree protection. ` +
+                            `Specify a concrete file or directory path.`
+                        )
+                    }
+                    if (targetPath.includes(".git")) {
+                        return `❌ Refused to allow .git-related path: '${targetPath}'. The .git directory is always blocked.`
+                    }
+                    const ttl = args.ttlMinutes ?? cfg.allowlistTtlMinutes
+                    const expiresAt = new Date(Date.now() + ttl * 60000).toISOString()
+                    const reason = (args.reason || "").trim()
+                    const entry = {
+                        path: targetPath,
+                        reason,
+                        bySession: tctx.sessionID,
+                        createdAt: new Date().toISOString(),
+                        expiresAt,
+                    }
+                    const entries = stateBackend.loadAllowlist()
+                    entries.push(entry)
+                    stateBackend.saveAllowlist(entries)
+                    stateBackend.appendAudit({
+                        type: "allow_add",
+                        sessionId: tctx.sessionID,
+                        path: targetPath,
+                        reason,
+                        expiresAt,
+                    })
+                    return (
+                        `✅ Allowlist entry added.\n` +
+                        `   path:     ${targetPath}\n` +
+                        `   expires:  ${expiresAt} (in ${ttl} min)\n` +
+                        `   reason:   ${reason || "(none)"}\n` +
+                        `   audit:    logged.`
                     )
                 },
             }),
@@ -385,8 +508,33 @@ const WorktreePlugin: Plugin = async (ctx) => {
             const args = output.args as MutableToolArgs
             if (!args || typeof args !== "object") return
             const binding = await resolveBinding(sessionId)
-            if (!binding) return
-            applyInterception(toolName, args, binding.repoRoot, binding.path)
+            const effectiveRoot = binding?.repoRoot ?? repoRoot
+            const allowlist = stateBackend.loadAllowlist()
+            const ctx: DecisionContext = {
+                isWrite: toolName === "write" || toolName === "edit",
+                toolName,
+                repoRoot: effectiveRoot,
+                worktreePath: binding?.path ?? null,
+                strictWrites: cfg.strictWrites,
+                strictGitOps: cfg.strictGitOps,
+                whitelist: cfg.mainWriteWhitelist,
+                protectedBranches: cfg.protectedBranches,
+                allowlistMatcher: (p: string) => isAllowlisted(p, effectiveRoot, allowlist),
+            }
+            try {
+                applyInterception(toolName, args, ctx)
+            } catch (e) {
+                const reason = (e as Error).message
+                if (reason.includes("strictWrites") || reason.includes("strictGitOps")) {
+                    stateBackend.appendAudit({
+                        type: "deny",
+                        sessionId,
+                        toolName,
+                        reason,
+                    })
+                }
+                throw e
+            }
         },
 
         "experimental.chat.system.transform": async (input, output) => {
@@ -394,20 +542,34 @@ const WorktreePlugin: Plugin = async (ctx) => {
             const sessionId = input?.sessionID
             if (!sessionId) return
             const binding = await resolveBinding(sessionId)
-            if (!binding) return
-            output.system.push(
-                `## ACTIVE WORKTREE — Your Working Directory Has Changed\n` +
-                    `Your working directory is now the git worktree:\n` +
-                    `  ${binding.path}\n` +
-                    `Branch: ${binding.branch}\n\n` +
-                    `The repository root (${binding.repoRoot}) is NOT your working directory.\n` +
-                    `Do NOT generate file paths starting with ${binding.repoRoot}.\n\n` +
-                    `When using write/edit/read tools, the filePath MUST be under the worktree:\n` +
-                    `  CORRECT: filePath starting with "${binding.path}"\n` +
-                    `  WRONG:   filePath starting with "${binding.repoRoot}"\n\n` +
-                    `For bash, your working directory is already the worktree.\n` +
-                    `For glob/grep, use the worktree path as the search root.`,
-            )
+            if (binding) {
+                output.system.push(
+                    `## ACTIVE WORKTREE — Your Working Directory Has Changed\n` +
+                        `Your working directory is now the git worktree:\n` +
+                        `  ${binding.path}\n` +
+                        `Branch: ${binding.branch}\n\n` +
+                        `The repository root (${binding.repoRoot}) is NOT your working directory.\n` +
+                        `Do NOT generate file paths starting with ${binding.repoRoot}.\n\n` +
+                        `When using write/edit/read tools, the filePath MUST be under the worktree:\n` +
+                        `  CORRECT: filePath starting with "${binding.path}"\n` +
+                        `  WRONG:   filePath starting with "${binding.repoRoot}"\n\n` +
+                        `For bash, your working directory is already the worktree.\n` +
+                        `For glob/grep, use the worktree path as the search root.`,
+                )
+                return
+            }
+            if (cfg.strictWrites || cfg.strictGitOps || cfg.sessionStartNudge) {
+                const protectedList =
+                    cfg.protectedBranches.length > 0 ? cfg.protectedBranches.join(", ") : "master, main"
+                output.system.push(
+                    `## WORKTREE-GUARD ACTIVE\n` +
+                        `This repo enforces worktree discipline (strictWrites=${cfg.strictWrites}, strictGitOps=${cfg.strictGitOps}).\n` +
+                        `- Before writing code, call worktree_prepare to create an isolated worktree.\n` +
+                        `- Writes to the main checkout without a binding will be BLOCKED (if strictWrites=true).\n` +
+                        `- Dangerous git operations on protected branches (${protectedList}) will be BLOCKED (if strictGitOps=true).\n` +
+                        `- For repo-level config/docs, use worktree_allow or add paths to mainWriteWhitelist.\n`,
+                )
+            }
         },
     }
 }
