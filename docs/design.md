@@ -249,3 +249,85 @@ F:\workspace_2\oc-plugin\
 - **绕过拦截 hook**：merge 用内部 `git()` helper（cwd 显式 = R），不经过 bash 工具的 `tool.execute.before` 改写，不受会话绑定影响
 
 **已实测**（干净仓库 E2E）：prepare → write（落入 worktree）→ merge preview → merge apply → 文件出现在仓库根、worktree 已删、分支已删、state `sessions: {}`。git log 显示 `Merge worktree 'wt/...'`（--no-ff）← `pre-merge snapshot` ← base。
+
+## 16. v0.4 增补：借鉴 zcode-worktree-guard 的多 session 安全机制
+
+> **任务来源**: 用户审查 v0.3 后判定"基本支持多 session 多 worktree 并行，但安全机制不足"。对比 zcode-worktree-guard 后决定借鉴其成熟机制，分 Tier 1/2/3 渐进实施。完整对比见 [docs/comparison-with-zcode.md](comparison-with-zcode.md)；实施计划见 `.omo/plans/worktree-borrow-zcode.md`（已通过 Momus 审查）。
+> **生成日期**: 2026-08-11
+
+### 16.1 改造哲学
+
+- **保持"可选 worktree"为默认**——不破坏现有用户行为（v0.3 的 52 个 case 仍 100% 通过）
+- **新增 strict 模式作为 opt-in**——学 zcode 的强制工作流
+- **多 session 安全机制默认开启**——这是 bugfix 不是 feature
+- **配置分项而非单一开关**——给用户细粒度控制（strictWrites / strictGitOps 独立）
+
+### 16.2 Tier 1（bugfix，默认开启）
+
+| # | 改动 | 借鉴自 |
+|---|---|---|
+| T1.1 | `atomicWriteFileSync`（tmp+rename）替代 `writeFileSync` | zcode `writeJson` (common.mjs L203-217) |
+| T1.2 | `findSessionsForWorktree` + cleanup/merge 悬空检查 | zcode `findBindingsForWorktree` (wt.mjs L141-150) |
+| T1.3 | `decidePathAction` / `decideSearchPathAction` 决策表纯函数重构 | zcode `decideWrite` (guard_hook.mjs L97-108) |
+
+**关键判断**：单进程异步事件仍存在 read-modify-write 竞态（JS 事件循环在 await 点切换）。原子写是必要修复，不是过度工程。
+
+### 16.3 Tier 2（opt-in 能力增强）
+
+| # | 改动 | 配置项 | 借鉴自 |
+|---|---|---|---|
+| T2.1 | `StateBackend` 抽象 + `GitCommonStateBackend`（每 session 一文件） | `stateLocation: "external"\|"git-common"` | zcode `<git-common-dir>/worktree-guard/bindings/` |
+| T2.2 | 无 binding 时 Write/Edit 主 checkout 拦截 | `strictWrites: boolean` | zcode fail-closed 决策第 9 条 |
+| T2.3 | 危险 git 操作正则识别（push/merge/checkout/branch -d） | `strictGitOps: boolean` + `protectedBranches: string[]` | zcode 正则组 (guard_hook.mjs L14-26) |
+| T2.4 | 声明式白名单 + 临时 allow 工具（TTL + 审计 + 危险路径剔除） | `mainWriteWhitelist: string[]` + `worktree_allow` 工具 | zcode `wt.mjs allow` (L226-271) |
+
+**不借鉴点**：
+- ❌ 直读 SQLite 做子代理继承（保留 opencode client API，不耦合宿主 schema）
+- ❌ 一键 merge 改三步授权（保留 opencode 一键流程；授权关可作为 opt-in 探讨）
+- ❌ Bash cd 命令解析（opencode bash 工具有 workdir 字段，直接注入）
+
+### 16.4 Tier 3（辅助增强）
+
+| # | 改动 | 借鉴自 |
+|---|---|---|
+| T3.1 | `SCHEMA_VERSION` + `ensureMeta` + loadState 检测老数据 stderr 警告 | zcode SCHEMA_VERSION + meta.json |
+| T3.2 | 审计日志扩展（prepare/cleanup/merge/deny 全记录到 jsonl） | zcode appendAudit |
+| T3.3 | SessionStart 纪律注入（仅 strict 模式生效） | zcode session_start.mjs |
+
+### 16.5 removeSyncedLinks 安全加固（来自 review-work 审查）
+
+> v0.4 实施完成后通过 `/review-work` 5 路并行审查发现的关键安全加固。
+
+**问题**：当用户配置 `symlinkDirs: ["node_modules"]`（README §Windows Support 把 junction 列为主推特性），worktree 内会创建 junction `node_modules → 主仓库 node_modules`。`git worktree remove --force` 在 Windows 上递归删除时**可能跟随 junction 误删主仓库的 node_modules**。
+
+**证据**：zcode v0.3 在 `wt.mjs` L180-188 + `common.mjs` L655-679 专门添加了 `removeSyncedLinks(wtPath, symlinkDirs)` 函数，注释明确："如果跳过此步直接 git worktree remove，递归删除可能跟随 junction 误删主仓库内容。"
+
+**修复**：在 lib.ts 新增 `removeSyncedLinks(worktreePath, symlinkDirs)`：
+```ts
+for (const d of symlinkDirs || []) {
+    const linkPath = path.join(worktreePath, d)
+    if (!existsSync(linkPath)) continue
+    try {
+        const st = lstatSync(linkPath)  // 不跟随
+        if (st.isSymbolicLink()) unlinkSync(linkPath)  // 不递归
+    } catch {}
+}
+```
+- 在 `worktree_cleanup` apply 的 `runHookCommands(preDelete)` 之后、`git worktree remove --force` 之前调用
+- 在 `worktree_merge` apply 的 `git worktree remove --force` 之前调用
+- 关键点：`lstatSync`（不跟随链接）+ `unlinkSync`（不递归），只删 `isSymbolicLink()` 的条目
+- 单元测试覆盖 4 个 case（删除+保留目标、空数组 no-op、不存在 no-op、普通目录不删）
+
+### 16.6 已知边界
+
+- `strictGitOps` 正则只识别 `git` 直接开头的命令，`cd x && git merge` 绕过（与 zcode 一致的已知限制）
+- `git-common` 模式下 `git rev-parse --git-common-dir` 失败时抛清晰错误（指引切换回 external）
+- 审计日志原样记录绝对路径（可能含本地用户名，README 已注明）
+- 子代理继承保留 opencode client API，不读 SQLite DB（与 zcode 不同，opencode 的优势）
+
+### 16.7 自审记录
+
+- **能否达成目标**：是。所有 Tier 1+2+3 子项 + removeSyncedLinks 加固均已实现并通过测试（168 case 100% 通过，typecheck 零错误）。
+- **副作用/破坏性**：默认配置（strictWrites=false, strictGitOps=false, stateLocation="external"）行为完全等价于 v0.3.1，原有 52 case 100% 通过。Strict 模式仅 opt-in 启用。审计/SessionStart 注入仅在 strict 模式下生效。
+- **更简单的替代**：考虑过"延后 removeSyncedLinks 到下个版本"——被否决（Windows 数据丢失风险真实存在，修复成本仅 10 行代码）。
+- **遗漏**：`emergencyDisable` 紧急开关（plan §8.3 提及但 Tier 3 未列）未实现，可作为 v0.5 工作；cross-worktree 写入检测（comparison §4.2 提及但 plan §9 明确不在范围）未实现。

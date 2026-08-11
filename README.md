@@ -107,6 +107,24 @@ worktree_cleanup(action="apply")                       // remove all merged work
 
 Cleanup only removes worktrees whose branches are merged into the base branch (unless `force=true`).
 
+### Escape Hatches (strict modes only)
+
+When `strictWrites=true` is enabled, all main-checkout writes without a binding are blocked. Two escape hatches let the agent (or you) write repo-level config/docs without entering a worktree:
+
+**Permanent whitelist** (sidecar config, no expiry):
+```json
+{ "mainWriteWhitelist": ["AGENTS.md", "docs/**/*.md", ".github/workflows/*.yml"] }
+```
+Dangerous patterns (`*`, `/`, `.`, `.git`, `**`) are auto-rejected with an stderr warning.
+
+**Temporary allow** (per-call, TTL + audit):
+```
+worktree_allow(action="add", path="README.md", reason="update docs header", ttlMinutes=30)
+worktree_allow(action="list")
+worktree_allow(action="clear")
+```
+Each `add` is audited to `<state-dir>/<projectId>.audit.jsonl` with type `allow_add`. Dangerous paths (`.git`, repo root, `*`) are rejected.
+
 ## Configuration
 
 Optional sidecar config at `.opencode/worktree-workflow.json` in your repo root:
@@ -124,7 +142,13 @@ Optional sidecar config at `.opencode/worktree-workflow.json` in your repo root:
     "hooks": {
         "postCreate": ["npm install"],
         "preDelete": []
-    }
+    },
+    "stateLocation": "external",
+    "strictWrites": false,
+    "strictGitOps": false,
+    "mainWriteWhitelist": [],
+    "allowlistTtlMinutes": 60,
+    "sessionStartNudge": false
 }
 ```
 
@@ -133,11 +157,37 @@ Optional sidecar config at `.opencode/worktree-workflow.json` in your repo root:
 | `branchPrefix` | `"wt/"` | Prefix for generated branch names |
 | `baseBranch` | `null` (auto-detect) | Base branch for new worktrees |
 | `worktreeRoot` | `~/.local/share/opencode/worktree` | Root directory for worktrees. Supports `$REPO`, `$HOME` |
-| `protectedBranches` | `[]` | Branches that cleanup will never remove |
+| `protectedBranches` | `[]` | Branches that cleanup will never remove (also used by `strictGitOps`) |
 | `sync.copyFiles` | `[]` | Files to copy from repo root into new worktrees |
-| `sync.symlinkDirs` | `[]` | Directories to symlink (junction on Windows) |
+| `sync.symlinkDirs` | `[]` | Directories to symlink (junction on Windows). Safely removed before `git worktree remove` to prevent junction-following recursive delete. |
 | `hooks.postCreate` | `[]` | Shell commands to run after worktree creation |
 | `hooks.preDelete` | `[]` | Shell commands to run before worktree removal |
+| `stateLocation` | `"external"` | Where to store session bindings. `"external"` = `~/.local/share/opencode/worktree-workflow/` (single file per project). `"git-common"` = `<git-common-dir>/worktree-isolation/` (one file per session, shares state across all linked worktrees). |
+| `strictWrites` | `false` | When `true`, Write/Edit to the main checkout without an active worktree binding is blocked. Read is always allowed. |
+| `strictGitOps` | `false` | When `true`, blocks `git push/merge/rebase/pull` on protected branches, `git checkout` to protected branches inside a worktree, and `git branch -d/-D`. |
+| `mainWriteWhitelist` | `[]` | Glob patterns (relative to repo root) for paths that can always be written to the main checkout without a worktree binding. Dangerous patterns (`*`, `/`, `.`, `.git`, `**`) are auto-rejected with an stderr warning. |
+| `allowlistTtlMinutes` | `60` | Default TTL (minutes) for entries added via `worktree_allow`. |
+| `sessionStartNudge` | `false` | Inject a discipline prompt at session start even when no binding exists (useful with strict modes). |
+
+### Strict Mode
+
+By default, the plugin is **opt-in**: sessions without a worktree binding behave exactly as if the plugin weren't installed. This preserves backward compatibility.
+
+Enable strict modes when you want to enforce worktree discipline:
+
+```json
+{
+    "strictWrites": true,
+    "strictGitOps": true,
+    "protectedBranches": ["master", "main", "release/*"]
+}
+```
+
+**`strictWrites=true`** — Write/Edit tools targeting the main checkout without a binding throw an error. The agent must call `worktree_prepare` first, or the path must match `mainWriteWhitelist`, or a temporary `worktree_allow` entry must cover it. Read is never blocked.
+
+**`strictGitOps=true`** — The bash hook recognizes (via regex) `git push`, `git merge`, `git rebase`, `git pull`, `git checkout`, `git switch`, `git branch -d/-D` and blocks operations on protected branches. `master` and `main` are always treated as protected (hardcoded safety net), plus any branches in `protectedBranches`.
+
+> ⚠️ **Known limitation**: only commands starting directly with `git` are recognized. Compound commands like `cd x && git merge` bypass the check. This matches zcode-worktree-guard's behavior and is documented as "raising the bar" rather than absolute defense.
 
 ## How It Works
 
@@ -165,8 +215,11 @@ When a bound session spawns subagents via `task()`, the subagent's session autom
 ## Limitations
 
 - **No TUI indicator**: opencode 1.18's plugin API doesn't support dynamic session title/metadata updates, so the worktree branch isn't visible in the status bar. The agent's responses will mention the worktree context.
-- **Single worktree per session**: A session can be bound to one worktree at a time. For true parallel work, use separate opencode sessions.
+- **One worktree per session, many sessions per repo**: A single session can be bound to one worktree at a time, but multiple sessions can run in parallel against different worktrees of the same repo. The plugin guards against dangling references: cleanup/merge refuse to delete a worktree that's still bound by another session.
 - **Bash path replacement is string-based**: Complex command strings with unusual path formats (8.3 short names, mixed separators) may not be fully rewritten. The plugin blocks commands where residual repo-root paths are detected after replacement.
+- **`strictGitOps` is regex-based**: Only commands starting directly with `git` are recognized. Compound commands like `cd x && git merge` bypass the check. This is documented as "raising the bar" rather than absolute defense (matches zcode-worktree-guard's behavior).
+- **`git-common` state location**: Requires `git rev-parse --git-common-dir` to succeed. Bare repos and unusual worktree configurations may fail; fall back to `"external"` if so.
+- **Audit log contains absolute paths**: The audit jsonl records paths as-is (including local usernames like `C:/Users/jane/...`). Redact manually before sharing.
 
 ## Testing
 
