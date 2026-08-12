@@ -158,7 +158,12 @@ export function computeProjectId(repoRoot: string): string {
 }
 
 export function norm(p: string): string {
-    return path.resolve(p).replace(/\\/g, "/").toLowerCase()
+    // Normalize backslashes to forward slashes BEFORE path.resolve(): on POSIX,
+    // path.resolve treats "\" as a literal filename character (not a separator), so a
+    // Windows-style path like "\tmp\wt" would be seen as relative and prepended with
+    // cwd, then never match its forward-slash counterpart. Converting separators first
+    // makes matching case-insensitive and cross-separator on every platform.
+    return path.resolve(p.replace(/\\/g, "/")).replace(/\\/g, "/").toLowerCase()
 }
 
 export function isInside(p: string, base: string): boolean {

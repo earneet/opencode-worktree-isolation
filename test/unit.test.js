@@ -383,11 +383,17 @@ describe("findSessionsForWorktree", () => {
     })
 
     test("matches paths case-insensitively and across separators", () => {
+        // Use an explicit POSIX-style literal so the separator/case variant is
+        // genuinely different on EVERY host OS. Deriving the variant from the
+        // platform-resolved WT_PATH made this test vacuous on Windows (WT_PATH has
+        // no forward slashes there, so .replace(/\//g,"\\") is a no-op) — which is
+        // why the POSIX-only norm() bug slipped through. See CI run 31482790119.
+        const posixPath = "/tmp/test/wt/wt-task-a"
         const state = mkState({
-            "sess-1": mkBinding(WT_PATH),
-            "sess-2": mkBinding(WT_PATH.replace(/\//g, "\\")),
+            "sess-1": mkBinding(posixPath),
+            "sess-2": mkBinding(posixPath.toUpperCase().replace(/\//g, "\\")),
         })
-        const result = findSessionsForWorktree(state, WT_PATH, "sess-1")
+        const result = findSessionsForWorktree(state, posixPath, "sess-1")
         assert.deepEqual(result, ["sess-2"])
     })
 
