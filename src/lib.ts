@@ -172,6 +172,14 @@ export function isInside(p: string, base: string): boolean {
     return np === nb || np.startsWith(nb + "/")
 }
 
+// .git must match as a complete path segment: substring matching like
+// includes("/.git") also hits "/.github" and "/.gitignore", which wrongly
+// blocked legitimate repo files.
+export function isDotGitPath(p: string): boolean {
+    const n = norm(p)
+    return n.endsWith("/.git") || n.includes("/.git/")
+}
+
 export function rewritesToWorktree(filePath: string, repoRoot: string, worktreePath: string): string {
     if (isInside(filePath, worktreePath)) return filePath
     if (!isInside(filePath, repoRoot)) return filePath
@@ -447,7 +455,7 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
 }
 
 export function decidePathAction(target: string, ctx: DecisionContext): DecisionResult {
-    if (norm(target).includes("/.git")) {
+    if (isDotGitPath(target)) {
         return { action: "deny", reason: `[worktree] access to .git paths is blocked: ${target}` }
     }
 
@@ -497,7 +505,7 @@ export function decideSearchPathAction(
     worktreePath: string,
 ): SearchPathResult {
     if (!p) return { action: "inject", newPath: worktreePath }
-    if (norm(p).includes("/.git")) {
+    if (isDotGitPath(p)) {
         return { action: "allow" }
     }
     if (isInside(p, worktreePath)) return { action: "allow" }
@@ -594,7 +602,7 @@ export function applyInterception(
         case "glob":
         case "grep": {
             const p = args.path
-            if (typeof p === "string" && norm(p).includes("/.git")) {
+            if (typeof p === "string" && isDotGitPath(p)) {
                 throw new Error(`[worktree] access to .git paths is blocked: ${p}`)
             }
             if (!worktreePath) return

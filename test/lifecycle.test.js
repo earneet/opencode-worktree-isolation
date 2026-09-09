@@ -521,6 +521,16 @@ describe("strict modes + worktree_allow", () => {
         }
     })
 
+    test("worktree_allow add accepts .github paths (not .git-related)", async () => {
+        const result = await strictPlugin.tool.worktree_allow.execute({
+            action: "add",
+            path: ".github/workflows/ci.yml",
+            reason: "update CI",
+            ttlMinutes: 30,
+        }, makeStTctx())
+        assert.ok(result.startsWith("✅"), `.github path must be accepted, got: ${result}`)
+    })
+
     test("worktree_allow add writes an audit log entry", async () => {
         const pid = computeProjectId(strictRepo)
         const auditFile = path.join(strictState, `${pid}.audit.jsonl`)
