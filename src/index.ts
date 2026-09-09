@@ -14,6 +14,7 @@ import {
     runHookCommands,
     removeSyncedLinks,
     applyInterception,
+    isDotGitPath,
     isAllowlisted,
     existsSync,
     mkdirSync,
@@ -466,7 +467,7 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             `Specify a concrete file or directory path.`
                         )
                     }
-                    if (targetPath.includes(".git")) {
+                    if (isDotGitPath(targetPath)) {
                         return `❌ Refused to allow .git-related path: '${targetPath}'. The .git directory is always blocked.`
                     }
                     const ttl = args.ttlMinutes ?? cfg.allowlistTtlMinutes

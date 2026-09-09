@@ -7,6 +7,7 @@ import { tmpdir } from "node:os"
 import {
     norm,
     isInside,
+    isDotGitPath,
     rewritesToWorktree,
     validateBranch,
     slugify,
@@ -240,6 +241,25 @@ test("applyInterception: glob to .git path throws", () => {
     assert.throws(() => applyInterception("glob", args, INT_CTX), /\.git paths is blocked/)
 })
 
+test("applyInterception: read to .github/.gitignore/.gitattributes is NOT blocked", () => {
+    for (const fp of [
+        REPO_FWD + "/.github/workflows/release.yml",
+        REPO_FWD + "/.gitignore",
+        REPO_FWD + "/.gitattributes",
+    ]) {
+        const args = { filePath: fp }
+        applyInterception("read", args, INT_CTX)
+        assert.equal(args.filePath, path.join(WT, path.relative(REPO, fp)))
+    }
+})
+
+test("applyInterception: glob to .github path is rewritten, not blocked", () => {
+    const fp = REPO_FWD + "/.github/workflows"
+    const args = { path: fp }
+    applyInterception("glob", args, INT_CTX)
+    assert.equal(args.path, path.join(WT, path.relative(REPO, fp)))
+})
+
 test("applyInterception: bash with no workdir/cwd gets worktree workdir", () => {
     const args = { command: "ls" }
     applyInterception("bash", args, INT_CTX)
@@ -466,6 +486,28 @@ describe("decidePathAction", () => {
         assert.equal(r.action, "deny")
     })
 
+    test("rewrite: .github/.gitignore paths are not mistaken for .git", () => {
+        for (const rel of ["/.github/workflows/release.yml", "/.gitignore", "/.gitattributes", "/.gitmodules"]) {
+            const target = REPO_P.replace(/\\/g, "/") + rel
+            const r = decidePathAction(target, mkCtx())
+            assert.equal(r.action, "rewrite", `${rel} must not be denied as .git`)
+            assert.ok(r.newTarget, `${rel} must have a rewrite target`)
+        }
+    })
+
+    test("deny: nested .git directory still blocked", () => {
+        const target = REPO_P.replace(/\\/g, "/") + "/vendor/lib/.git/config"
+        const r = decidePathAction(target, mkCtx())
+        assert.equal(r.action, "deny")
+    })
+
+    test("no binding: .github path allows freely (not treated as .git)", () => {
+        const target = REPO_P.replace(/\\/g, "/") + "/.github/workflows/ci.yml"
+        const r = decidePathAction(target, mkCtx({ worktreePath: null, isWrite: false, toolName: "read" }))
+        assert.equal(r.action, "allow")
+        assert.equal(r.source, "no-binding-free")
+    })
+
     test("strictWrites=true, no binding, write → deny", () => {
         const target = REPO_P.replace(/\\/g, "/") + "/src/foo.ts"
         const r = decidePathAction(target, mkCtx({ worktreePath: null, strictWrites: true, isWrite: true }))
@@ -579,6 +621,34 @@ describe("decideSearchPathAction", () => {
         const r = decideSearchPathAction(p, REPO_S, WT_S)
         assert.equal(r.action, "allow")
         assert.equal(r.newPath, undefined)
+    })
+
+    test("rewrite: .github path is rewritten, not treated as .git", () => {
+        const p = REPO_S.replace(/\\/g, "/") + "/.github/workflows"
+        const r = decideSearchPathAction(p, REPO_S, WT_S)
+        assert.equal(r.action, "rewrite")
+        assert.equal(r.newPath, path.join(WT_S, path.relative(REPO_S, p)))
+    })
+})
+
+describe("isDotGitPath", () => {
+    const REPO_D = path.resolve("/tmp/dotgit/repo")
+
+    test("true when .git is a complete path segment", () => {
+        assert.equal(isDotGitPath(REPO_D + "/.git"), true)
+        assert.equal(isDotGitPath(REPO_D + "/.git/config"), true)
+        assert.equal(isDotGitPath(REPO_D + "/.git\\hooks"), true)
+        assert.equal(isDotGitPath(REPO_D.replace(/\//g, "\\") + "\\.git"), true)
+        assert.equal(isDotGitPath(REPO_D + "/vendor/lib/.git"), true)
+    })
+
+    test("false when .git is only a name prefix", () => {
+        assert.equal(isDotGitPath(REPO_D + "/.github/workflows/release.yml"), false)
+        assert.equal(isDotGitPath(REPO_D + "/.gitignore"), false)
+        assert.equal(isDotGitPath(REPO_D + "/.gitattributes"), false)
+        assert.equal(isDotGitPath(REPO_D + "/.gitmodules"), false)
+        assert.equal(isDotGitPath(REPO_D + "/.gitkeep"), false)
+        assert.equal(isDotGitPath(REPO_D + "/src/foo.ts"), false)
     })
 })
 
