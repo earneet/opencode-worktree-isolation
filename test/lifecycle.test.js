@@ -210,6 +210,87 @@ test("worktree_merge refuses to merge worktree still bound by another session", 
     assert.ok(mergeOk.startsWith("✅"), `merge after removing other binding should succeed, got: ${mergeOk}`)
 })
 
+test("merge preview lists the files that will be auto-committed", async () => {
+    const prep = await plugin.tool.worktree_prepare.execute({ title: "preview list" }, makeTctx())
+    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+    const pid = computeProjectId(repoDir)
+    const wtPath = loadState(pid).sessions[SESSION].path
+    writeFileSync(path.join(wtPath, "uncommitted-a.txt"), "a\n")
+    writeFileSync(path.join(wtPath, "uncommitted-b.txt"), "b\n")
+
+    const result = await plugin.tool.worktree_merge.execute({ action: "preview" }, makeTctx())
+    assert.ok(result.includes("uncommitted-a.txt"), `preview must list uncommitted-a.txt, got:\n${result}`)
+    assert.ok(result.includes("uncommitted-b.txt"), `preview must list uncommitted-b.txt, got:\n${result}`)
+
+    const cleanup = await plugin.tool.worktree_cleanup.execute(
+        { action: "apply", branch: "wt/preview-list", force: true },
+        makeTctx(),
+    )
+    assert.ok(cleanup.includes("wt/preview-list: removed"), `cleanup should succeed, got: ${cleanup}`)
+})
+
+test("zombie binding: externally deleted worktree dir no longer rewrites paths (issue #7)", async () => {
+    const prep = await plugin.tool.worktree_prepare.execute({ title: "zombie binding" }, makeTctx())
+    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+    const pid = computeProjectId(repoDir)
+    const wtPath = loadState(pid).sessions[SESSION].path
+    assert.ok(existsSync(wtPath), "worktree created")
+
+    rmSync(wtPath, { recursive: true, force: true })
+    assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
+
+    const output = { args: { filePath: path.join(repoDir, "main-checkout.txt") } }
+    await plugin["tool.execute.before"](
+        { tool: "read", sessionID: SESSION, callID: "z1" },
+        output,
+    )
+    assert.equal(
+        output.args.filePath,
+        path.join(repoDir, "main-checkout.txt"),
+        `ghost binding must NOT rewrite paths (got ${output.args.filePath})`,
+    )
+    assert.ok(!loadState(pid).sessions[SESSION], "zombie binding must be auto-cleared")
+})
+
+test("worktree_cleanup prunes and unbinds when the worktree dir is already missing (issue #7)", async () => {
+    const prep = await plugin.tool.worktree_prepare.execute({ title: "missing dir" }, makeTctx())
+    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+    const pid = computeProjectId(repoDir)
+    const wtPath = loadState(pid).sessions[SESSION].path
+    rmSync(wtPath, { recursive: true, force: true })
+    assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
+
+    const result = await plugin.tool.worktree_cleanup.execute(
+        { action: "apply", branch: "wt/missing-dir", force: true },
+        makeTctx(),
+    )
+    assert.ok(result.includes("wt/missing-dir: removed"), `cleanup must handle missing dir, got: ${result}`)
+    assert.ok(!loadState(pid).sessions[SESSION], "session unbound after missing-dir cleanup")
+})
+
+test("merge apply survives a path-length deletion failure via fallback deletion (issue #7)", async () => {
+    const prep = await plugin.tool.worktree_prepare.execute({ title: "long path" }, makeTctx())
+    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+    const pid = computeProjectId(repoDir)
+    const wtPath = loadState(pid).sessions[SESSION].path
+    writeFileSync(path.join(wtPath, "feature.txt"), "long path feature\n")
+
+    // Build a directory nest deeper than Windows MAX_PATH (260). Node's fs handles
+    // long paths fine when creating them, but `git worktree remove` does not.
+    const seg = "0123456789"
+    let deep = wtPath
+    for (let i = 0; i < 30; i++) deep = path.join(deep, `d-${seg}`)
+    mkdirSync(deep, { recursive: true })
+    writeFileSync(path.join(deep, "leaf.txt"), "deep\n")
+    assert.ok(deep.length > 300, `test requires a >300-char path, got ${deep.length}`)
+
+    const result = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
+    assert.ok(result.startsWith("✅"), `merge must succeed even when removal needs the fallback, got:\n${result}`)
+    assert.ok(!existsSync(wtPath), "worktree dir must be removed by the fallback")
+    assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merge result must land in repo root")
+    assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound after fallback cleanup")
+})
+
 describe("git-common state backend", () => {
     const gcTestRoot = mkdtempSync(path.join(tmpdir(), "ocwt-git-common-"))
     const gcRepoDir = path.join(gcTestRoot, "repo")
