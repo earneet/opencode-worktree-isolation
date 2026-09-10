@@ -13,8 +13,10 @@ import {
     symlinkSync,
     readdirSync,
     appendFileSync,
+    rmSync,
+    mkdtempSync,
 } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import * as path from "node:path"
 
 export const IS_WIN = process.platform === "win32"
@@ -437,6 +439,45 @@ export function removeSyncedLinks(worktreePath: string, symlinkDirs: string[]): 
             // 静默：linkPath 不是 symlink 或已不存在，让 git worktree remove 处理
         }
     }
+}
+
+export interface RemovalResult {
+    ok: boolean
+    method: string
+    err?: string
+}
+
+// `git worktree remove` fails with "Filename too long" on Windows when the tree
+// contains untracked paths beyond MAX_PATH (e.g. bun's isolated node_modules
+// layout). robocopy mirrors against an empty dir — robocopy internally uses
+// long-path-capable APIs — leaving an empty shell that rmSync can remove.
+export function removeWorktreeDir(target: string): RemovalResult {
+    if (!existsSync(target)) return { ok: true, method: "already-missing" }
+    if (IS_WIN) {
+        const empty = mkdtempSync(path.join(tmpdir(), "wt-mirror-empty-"))
+        try {
+            const r = spawnSync(
+                "robocopy",
+                [empty, target, "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:2", "/W:1"],
+                { encoding: "utf8" },
+            )
+            // robocopy exit codes 0-7 are success; >=8 signals failure
+            if (r.error) return { ok: false, method: "robocopy", err: String(r.error) }
+            if ((r.status ?? 8) >= 8) {
+                return { ok: false, method: "robocopy", err: (r.stderr || "").trim() || `exit code ${r.status}` }
+            }
+        } finally {
+            try {
+                rmSync(empty, { recursive: true, force: true })
+            } catch {}
+        }
+    }
+    try {
+        rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    } catch (e) {
+        return { ok: false, method: "rmSync", err: (e as Error).message }
+    }
+    return { ok: true, method: IS_WIN ? "robocopy-mirror" : "rmSync" }
 }
 
 export function atomicWriteFileSync(filePath: string, data: string): void {

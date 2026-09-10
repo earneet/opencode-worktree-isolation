@@ -15,6 +15,7 @@ import {
     removeSyncedLinks,
     applyInterception,
     isDotGitPath,
+    removeWorktreeDir,
     isAllowlisted,
     existsSync,
     mkdirSync,
@@ -37,15 +38,38 @@ const WorktreePlugin: Plugin = async (ctx) => {
 
     const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
 
+    // A binding whose worktree directory no longer exists (external deletion,
+    // interrupted cleanup) is a zombie: honoring it would rewrite every
+    // read/write/edit into a dead path. Expire it instead.
+    const materializeBinding = (
+        b: SessionBinding,
+        ownerSid: string,
+    ): (SessionBinding & { _state?: WorktreeState }) | null => {
+        if (existsSync(b.path)) return { ...b, _state: stateBackend.loadAll() }
+        stateBackend.clearBinding(ownerSid)
+        stateBackend.appendAudit({
+            type: "binding_expired",
+            sessionId: ownerSid,
+            branch: b.branch,
+            reason: `worktree directory no longer exists: ${b.path}`,
+        })
+        console.warn(
+            `[worktree] binding expired: worktree directory ${b.path} no longer exists. ` +
+                `Session ${ownerSid} unbound; file operations now target the repo root.`,
+        )
+        return null
+    }
+
     async function resolveBinding(
         sessionId: string,
     ): Promise<(SessionBinding & { _state?: WorktreeState }) | null> {
         if (!sessionId) return null
         const direct = stateBackend.loadBinding(sessionId)
-        if (direct) return { ...direct, _state: stateBackend.loadAll() }
+        if (direct) return materializeBinding(direct, sessionId)
         if (inheritCache.has(sessionId)) return inheritCache.get(sessionId)!
         let current = sessionId
         let found: SessionBinding | null = null
+        let ownerSid: string | null = null
         for (let i = 0; i < MAX_PARENT_DEPTH; i++) {
             let parentId: string | undefined
             try {
@@ -58,16 +82,22 @@ const WorktreePlugin: Plugin = async (ctx) => {
             const inherited = stateBackend.loadBinding(parentId)
             if (inherited) {
                 found = inherited
+                ownerSid = parentId
                 break
             }
             current = parentId
         }
-        if (found) {
+        if (found && ownerSid !== null) {
+            const live = materializeBinding(found, ownerSid)
+            if (!live) {
+                inheritCache.set(sessionId, null)
+                return null
+            }
             const snapshot: SessionBinding = {
-                branch: found.branch,
-                path: found.path,
-                repoRoot: found.repoRoot,
-                title: found.title,
+                branch: live.branch,
+                path: live.path,
+                repoRoot: live.repoRoot,
+                title: live.title,
                 createdAt: new Date().toISOString(),
                 inherited: true,
             }
@@ -252,12 +282,23 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         }
                         runHookCommands(cfg.hooks.preDelete || [], b.path)
                         removeSyncedLinks(b.path, cfg.sync.symlinkDirs || [])
-                        git(["add", "-A"], b.path)
-                        git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], b.path)
-                        const rm = git(["worktree", "remove", "--force", b.path], R)
-                        if (!rm.ok) {
-                            skipped.push(`  ⚠ ${b.branch}: worktree remove failed - ${(rm.stderr || "").trim()}`)
-                            continue
+                        if (existsSync(b.path)) {
+                            git(["add", "-A"], b.path)
+                            git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], b.path)
+                            const rm = git(["worktree", "remove", "--force", b.path], R)
+                            if (!rm.ok) {
+                                const fb = removeWorktreeDir(b.path)
+                                if (!fb.ok) {
+                                    skipped.push(
+                                        `  ⚠ ${b.branch}: worktree remove failed - ${(rm.stderr || "").trim()} ` +
+                                            `(fallback ${fb.method} failed: ${fb.err ?? "unknown error"})`,
+                                    )
+                                    continue
+                                }
+                                git(["worktree", "prune"], R)
+                            }
+                        } else {
+                            git(["worktree", "prune"], R)
                         }
                         git(["branch", "-D", b.branch], R)
                         stateBackend.clearBinding(sid)
@@ -323,7 +364,8 @@ const WorktreePlugin: Plugin = async (ctx) => {
                     const diffStat = diffRes.ok ? diffRes.stdout.trim() : ""
                     const dirtyRes = git(["status", "--porcelain"], W)
                     const dirty = dirtyRes.ok ? dirtyRes.stdout.trim() : ""
-                    const dirtyCount = dirty ? dirty.split("\n").length : 0
+                    const dirtyFiles = dirty ? dirty.split("\n").map((l) => l.trim()).filter(Boolean) : []
+                    const dirtyCount = dirtyFiles.length
 
                     if (args.action === "preview") {
                         return (
@@ -332,7 +374,10 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             `   commits to merge:\n${commits ? commits.split("\n").map((l) => "     " + l).join("\n") : "     (none — already up to date)"}\n` +
                             `   diff stat:\n${diffStat ? diffStat.split("\n").map((l) => "     " + l).join("\n") : "     (no file changes)"}\n` +
                             (dirtyCount
-                                ? `   ⚠ ${dirtyCount} uncommitted change(s) in the worktree will be auto-committed before merge.\n`
+                                ? `   ⚠ ${dirtyCount} uncommitted change(s) will be auto-committed before merge:\n` +
+                                  dirtyFiles.slice(0, 20).map((l) => `     ${l}`).join("\n") +
+                                  (dirtyCount > 20 ? `\n     … and ${dirtyCount - 20} more` : "") +
+                                  "\n"
                                 : "") +
                             `\nApply with: worktree_merge(action="apply"${args.branch ? `, branch="${branch}"` : ""}). ` +
                             `The merge aborts safely if conflicts arise.`
@@ -380,10 +425,19 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         removeSyncedLinks(W, cfg.sync.symlinkDirs || [])
                         const rm = git(["worktree", "remove", "--force", W], R)
                         if (!rm.ok) {
-                            return (
-                                `⚠ Merged "${branch}" into "${target}", but worktree removal failed: ${rm.stderr.trim()}\n` +
-                                `Worktree left at ${W}; branch "${branch}" kept. Remove manually when ready.`
-                            )
+                            const fb = removeWorktreeDir(W)
+                            if (!fb.ok) {
+                                return (
+                                    `⚠ Merged "${branch}" into "${target}", but worktree removal failed: ${rm.stderr.trim()}\n` +
+                                    `⚠ Fallback deletion (${fb.method}) also failed: ${fb.err ?? "unknown error"}\n` +
+                                    `This session is STILL BOUND to ${W} — read/write/edit keep targeting it. ` +
+                                    `The binding expires automatically once the directory is deleted, e.g.:\n` +
+                                    `   robocopy <empty-dir> ${W} /MIR\n` +
+                                    `   rmdir /s /q <empty-dir>\n` +
+                                    `   git worktree prune`
+                                )
+                            }
+                            git(["worktree", "prune"], R)
                         }
                     } else {
                         git(["worktree", "prune"], R)

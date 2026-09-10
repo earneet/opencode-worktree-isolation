@@ -8,6 +8,7 @@ import {
     norm,
     isInside,
     isDotGitPath,
+    removeWorktreeDir,
     rewritesToWorktree,
     validateBranch,
     slugify,
@@ -649,6 +650,39 @@ describe("isDotGitPath", () => {
         assert.equal(isDotGitPath(REPO_D + "/.gitmodules"), false)
         assert.equal(isDotGitPath(REPO_D + "/.gitkeep"), false)
         assert.equal(isDotGitPath(REPO_D + "/src/foo.ts"), false)
+    })
+})
+
+describe("removeWorktreeDir", () => {
+    test("removes a deep directory tree", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "wt-rmtest-"))
+        const tree = path.join(base, "a", "b", "c", "d", "e")
+        mkdirSync(tree, { recursive: true })
+        writeFileSync(path.join(tree, "f.txt"), "x")
+        const r = removeWorktreeDir(path.join(base, "a"))
+        assert.equal(r.ok, true, `fallback removal must succeed: ${JSON.stringify(r)}`)
+        assert.equal(existsSync(path.join(base, "a")), false, "tree must be gone")
+        rmSync(base, { recursive: true, force: true })
+    })
+
+    test("already-missing target reports ok without touching anything", () => {
+        const r = removeWorktreeDir(path.join(tmpdir(), `definitely-missing-${Date.now()}`))
+        assert.equal(r.ok, true)
+        assert.equal(r.method, "already-missing")
+    })
+
+    test("removes a tree that exceeds Windows MAX_PATH via the same API surface", () => {
+        const base = mkdtempSync(path.join(tmpdir(), "wt-rmlong-"))
+        const seg = "0123456789abcdef"
+        let deep = path.join(base, "root")
+        for (let i = 0; i < 25; i++) deep = path.join(deep, `d-${seg}`)
+        mkdirSync(deep, { recursive: true })
+        writeFileSync(path.join(deep, "leaf.txt"), "deep\n")
+        assert.ok(deep.length > 300, `test requires a >300-char path, got ${deep.length}`)
+        const r = removeWorktreeDir(path.join(base, "root"))
+        assert.equal(r.ok, true, `fallback removal must succeed on long paths: ${JSON.stringify(r)}`)
+        assert.equal(existsSync(path.join(base, "root")), false)
+        rmSync(base, { recursive: true, force: true })
     })
 })
 
