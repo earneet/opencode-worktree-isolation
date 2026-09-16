@@ -22,6 +22,9 @@ import {
     copyFileSync,
     statSync,
     symlinkSync,
+    norm,
+    findSessionsForWorktree,
+    mergedBranchSet,
 } from "./lib.js"
 import type { DecisionContext, MutableToolArgs, SessionBinding, WorktreeState } from "./lib.js"
 
@@ -38,21 +41,74 @@ const WorktreePlugin: Plugin = async (ctx) => {
 
     const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
 
+    const releaseBinding = (sid: string, reason: string, auditType: "binding_released" | "binding_expired") => {
+        stateBackend.clearBinding(sid)
+        inheritCache.delete(sid)
+        stateBackend.appendAudit({ type: auditType, sessionId: sid, reason })
+    }
+
+    // Inherited bindings belong to sub-agent sessions that are, by construction,
+    // descendants of the owner session. They ride along with the worktree: when
+    // the owner merges or cleans up, they are released instead of blocking.
+    const releaseInheritedForWorktree = (
+        state: WorktreeState,
+        worktreePath: string,
+        excludeSid: string,
+        reason: string,
+    ): string[] => {
+        const released: string[] = []
+        for (const sid of findSessionsForWorktree(state, worktreePath, excludeSid)) {
+            if (state.sessions[sid]?.inherited) {
+                releaseBinding(sid, reason, "binding_released")
+                released.push(sid)
+            }
+        }
+        return released
+    }
+
+    const clearAllForWorktree = (worktreePath: string, reason: string) => {
+        const nWt = norm(worktreePath)
+        for (const { sessionId, binding } of stateBackend.listBindings()) {
+            if (norm(binding.path) === nWt) {
+                releaseBinding(sessionId, reason, "binding_released")
+            }
+        }
+    }
+
+    const reapMissingDirs = (): string[] => {
+        const cleared: string[] = []
+        for (const { sessionId, binding } of stateBackend.listBindings()) {
+            if (!existsSync(binding.path)) {
+                releaseBinding(
+                    sessionId,
+                    `worktree directory no longer exists: ${binding.path}`,
+                    "binding_expired",
+                )
+                cleared.push(sessionId)
+            }
+        }
+        return cleared
+    }
+
     // A binding whose worktree directory no longer exists (external deletion,
     // interrupted cleanup) is a zombie: honoring it would rewrite every
-    // read/write/edit into a dead path. Expire it instead.
+    // read/write/edit into a dead path. Expire it instead — and every other
+    // binding for the same path with it, since they are all zombies too.
     const materializeBinding = (
         b: SessionBinding,
         ownerSid: string,
     ): (SessionBinding & { _state?: WorktreeState }) | null => {
         if (existsSync(b.path)) return { ...b, _state: stateBackend.loadAll() }
+        const reason = `worktree directory no longer exists: ${b.path}`
+        stateBackend.appendAudit({ type: "binding_expired", sessionId: ownerSid, branch: b.branch, reason })
         stateBackend.clearBinding(ownerSid)
-        stateBackend.appendAudit({
-            type: "binding_expired",
-            sessionId: ownerSid,
-            branch: b.branch,
-            reason: `worktree directory no longer exists: ${b.path}`,
-        })
+        inheritCache.delete(ownerSid)
+        const nWt = norm(b.path)
+        for (const { sessionId, binding } of stateBackend.listBindings()) {
+            if (sessionId !== ownerSid && norm(binding.path) === nWt) {
+                releaseBinding(sessionId, reason, "binding_expired")
+            }
+        }
         console.warn(
             `[worktree] binding expired: worktree directory ${b.path} no longer exists. ` +
                 `Session ${ownerSid} unbound; file operations now target the repo root.`,
@@ -229,68 +285,99 @@ const WorktreePlugin: Plugin = async (ctx) => {
                 },
                 async execute(args, tctx) {
                     const R = tctx.directory
-                    const state = stateBackend.loadAll()
-                    const entries = Object.entries(state.sessions)
-                    if (!entries.length) return "No worktrees are currently bound to this project."
                     const base = cfg.baseBranch || defaultBaseBranch(R)
                     if (args.action === "preview") {
-                        const mergedSet = base
-                            ? new Set(
-                                  git(["branch", "--merged", base], R).stdout
-                                      .split("\n")
-                                      .map((s) => s.trim().replace(/^\*/, "").trim()),
-                              )
-                            : null
-                        const lines = entries.map(([sid, b]) => {
+                        const reaped = reapMissingDirs()
+                        const state = stateBackend.loadAll()
+                        const entries = Object.entries(state.sessions)
+                        if (!entries.length) {
+                            return (
+                                "No worktrees are currently bound to this project." +
+                                (reaped.length ? `\n(released ${reaped.length} expired binding(s) whose worktree directories are gone)` : "")
+                            )
+                        }
+                        const mergedSet = mergedBranchSet(R, base)
+                        const byPath = new Map<string, { binding: SessionBinding; sessions: number }>()
+                        for (const [, b] of entries) {
+                            const key = norm(b.path)
+                            const existing = byPath.get(key)
+                            if (!existing) {
+                                byPath.set(key, { binding: b, sessions: 1 })
+                            } else {
+                                existing.sessions += 1
+                                if (!b.inherited) existing.binding = b
+                            }
+                        }
+                        const lines = [...byPath.values()].map(({ binding: b, sessions }) => {
                             const merged = mergedSet ? mergedSet.has(b.branch) : null
                             const dirty = git(["status", "--porcelain"], b.path).stdout.trim() ? "dirty" : "clean"
                             const present = existsSync(b.path) ? "present" : "missing"
                             const flag = cfg.protectedBranches.includes(b.branch) ? " 🔒protected" : ""
-                            return `  ${b.branch.padEnd(28)} ${(merged === true ? "merged" : merged === false ? "unmerged" : "unknown").padEnd(10)} ${dirty.padEnd(7)} ${present}${flag}  "${b.title || ""}"`
+                            return `  ${b.branch.padEnd(28)} ${(merged === true ? "merged" : merged === false ? "unmerged" : "unknown").padEnd(10)} ${dirty.padEnd(7)} ${present}  sessions=${sessions}${flag}  "${b.title || ""}"`
                         })
                         return (
                             `Managed worktrees (base: ${base || "?"}):\n` +
                             lines.join("\n") +
+                            (reaped.length
+                                ? `\n\n(released ${reaped.length} expired binding(s) whose worktree directories are gone)`
+                                : "") +
                             `\n\nTo remove: worktree_cleanup(action=apply, branch=<name>). ` +
                             `Only merged branches are removed unless force=true.`
                         )
                     }
                     const removed: string[] = []
                     const skipped: string[] = []
+                    const mergedSet = mergedBranchSet(R, base)
+                    const state = stateBackend.loadAll()
+                    const entries = Object.entries(state.sessions)
+                    const processedPaths = new Set<string>()
                     for (const [sid, b] of entries) {
-                        if (cfg.protectedBranches.includes(b.branch)) {
-                            skipped.push(`  🔒 ${b.branch}: protected`)
+                        const nPath = norm(b.path)
+                        if (processedPaths.has(nPath)) continue
+                        processedPaths.add(nPath)
+                        // Multiple sessions may bind one worktree (owner + inherited
+                        // sub-agents); process each worktree exactly once, driven by
+                        // its direct (non-inherited) binding when one exists.
+                        const rep = entries.find(([, b2]) => norm(b2.path) === nPath && !b2.inherited)
+                        const repSid = rep ? rep[0] : sid
+                        const repBinding = rep ? rep[1] : b
+                        if (cfg.protectedBranches.includes(repBinding.branch)) {
+                            skipped.push(`  🔒 ${repBinding.branch}: protected`)
                             continue
                         }
-                        if (args.branch && b.branch !== args.branch) continue
-                        const mergedSet = base
-                            ? new Set(
-                                  git(["branch", "--merged", base], R).stdout
-                                      .split("\n")
-                                      .map((s) => s.trim().replace(/^\*/, "").trim()),
-                              )
-                            : null
-                        const isMerged = mergedSet ? mergedSet.has(b.branch) : true
+                        if (args.branch && repBinding.branch !== args.branch) continue
+                        const isMerged = mergedSet ? mergedSet.has(repBinding.branch) : true
                         if (!isMerged && !args.force) {
-                            skipped.push(`  ⏭  ${b.branch}: unmerged (use force=true to remove)`)
+                            skipped.push(`  ⏭  ${repBinding.branch}: unmerged (use force=true to remove)`)
                             continue
                         }
-                        const otherSessions = stateBackend.findSessionsForWorktree(b.path, sid)
-                        if (otherSessions.length > 0) {
-                            skipped.push(`  ⚠ ${b.branch}: 仍被其他会话绑定 (${otherSessions.join(", ")})，跳过删除`)
+                        const liveState = stateBackend.loadAll()
+                        const released = releaseInheritedForWorktree(
+                            liveState,
+                            repBinding.path,
+                            repSid,
+                            "released with worktree cleanup (inherited sub-agent binding)",
+                        )
+                        const otherSessions = findSessionsForWorktree(liveState, repBinding.path, repSid)
+                        const blocking = otherSessions.filter((s) => !liveState.sessions[s]?.inherited)
+                        if (blocking.length > 0) {
+                            skipped.push(
+                                `  ⚠ ${repBinding.branch}: 仍被其他独立会话绑定 (${blocking.join(", ")})，跳过删除` +
+                                    (released.length ? `（已自动释放 ${released.length} 个 inherited 子会话绑定）` : ""),
+                            )
                             continue
                         }
-                        runHookCommands(cfg.hooks.preDelete || [], b.path)
-                        removeSyncedLinks(b.path, cfg.sync.symlinkDirs || [])
-                        if (existsSync(b.path)) {
-                            git(["add", "-A"], b.path)
-                            git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], b.path)
-                            const rm = git(["worktree", "remove", "--force", b.path], R)
+                        runHookCommands(cfg.hooks.preDelete || [], repBinding.path)
+                        removeSyncedLinks(repBinding.path, cfg.sync.symlinkDirs || [])
+                        if (existsSync(repBinding.path)) {
+                            git(["add", "-A"], repBinding.path)
+                            git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], repBinding.path)
+                            const rm = git(["worktree", "remove", "--force", repBinding.path], R)
                             if (!rm.ok) {
-                                const fb = removeWorktreeDir(b.path)
+                                const fb = removeWorktreeDir(repBinding.path)
                                 if (!fb.ok) {
                                     skipped.push(
-                                        `  ⚠ ${b.branch}: worktree remove failed - ${(rm.stderr || "").trim()} ` +
+                                        `  ⚠ ${repBinding.branch}: worktree remove failed - ${(rm.stderr || "").trim()} ` +
                                             `(fallback ${fb.method} failed: ${fb.err ?? "unknown error"})`,
                                     )
                                     continue
@@ -300,15 +387,19 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         } else {
                             git(["worktree", "prune"], R)
                         }
-                        git(["branch", "-D", b.branch], R)
-                        stateBackend.clearBinding(sid)
+                        git(["branch", "-D", repBinding.branch], R)
+                        stateBackend.clearBinding(repSid)
+                        clearAllForWorktree(repBinding.path, "released with worktree cleanup")
                         stateBackend.appendAudit({
                             type: "cleanup",
-                            sessionId: sid,
-                            branch: b.branch,
+                            sessionId: repSid,
+                            branch: repBinding.branch,
                             reason: args.force ? "force" : "merged",
                         })
-                        removed.push(`  ✅ ${b.branch}: removed`)
+                        removed.push(
+                            `  ✅ ${repBinding.branch}: removed` +
+                                (released.length ? ` (released ${released.length} inherited binding(s))` : ""),
+                        )
                     }
                     return (
                         `Cleanup apply complete.\n` +
@@ -398,12 +489,23 @@ const WorktreePlugin: Plugin = async (ctx) => {
                             trackedChanges
                         )
                     }
+                    let inheritedReleased = 0
                     if (boundSid) {
-                        const otherSessions = stateBackend.findSessionsForWorktree(W, boundSid)
-                        if (otherSessions.length > 0) {
+                        const otherSessions = findSessionsForWorktree(state, W, boundSid)
+                        inheritedReleased = releaseInheritedForWorktree(
+                            state,
+                            W,
+                            boundSid,
+                            "released with worktree merge (inherited sub-agent binding)",
+                        ).length
+                        const blocking = otherSessions.filter((s) => !state.sessions[s]?.inherited)
+                        if (blocking.length > 0) {
                             return (
-                                `❌ Worktree "${branch}" 仍被其他会话绑定 (${otherSessions.join(", ")})。\n` +
-                                `请让那些会话先退出（worktree_cleanup 仅清理本会话绑定），或手动确认后用 force。`
+                                `❌ Worktree "${branch}" 仍被其他独立会话绑定 (${blocking.join(", ")})。\n` +
+                                (inheritedReleased
+                                    ? `已自动释放 ${inheritedReleased} 个 inherited 子会话绑定。\n`
+                                    : "") +
+                                `请让绑定该 worktree 的独立会话先退出/解绑，然后重试。`
                             )
                         }
                     }
@@ -445,7 +547,9 @@ const WorktreePlugin: Plugin = async (ctx) => {
                     git(["branch", "-d", branch], R)
                     if (boundSid) {
                         stateBackend.clearBinding(boundSid)
+                        inheritCache.delete(boundSid)
                     }
+                    clearAllForWorktree(W, "released with worktree merge")
                     stateBackend.appendAudit({
                         type: "merge",
                         sessionId: boundSid ?? tctx.sessionID,
@@ -456,6 +560,9 @@ const WorktreePlugin: Plugin = async (ctx) => {
                         `✅ Merged "${branch}" into "${target}" and cleaned up.\n` +
                         `   worktree removed: ${W}\n` +
                         `   branch deleted:   ${branch}\n` +
+                        (inheritedReleased
+                            ? `   inherited bindings released: ${inheritedReleased}\n`
+                            : "") +
                         `   session unbound — file operations now target the repo root (${R}) again.`
                     )
                 },
@@ -553,6 +660,27 @@ const WorktreePlugin: Plugin = async (ctx) => {
                     )
                 },
             }),
+        },
+
+        event: async ({ event }) => {
+            if (event.type === "session.idle") {
+                // A finished sub-agent session never calls tools again, so nothing
+                // else would ever expire its inherited binding (issue #7). Releasing
+                // here is safe: lazy parent-chain inheritance re-binds the session
+                // transparently if it resumes work later.
+                const sid = event.properties.sessionID
+                const b = stateBackend.loadBinding(sid)
+                if (b?.inherited) {
+                    releaseBinding(sid, "sub-agent session finished (idle)", "binding_released")
+                }
+                return
+            }
+            if (event.type === "session.deleted") {
+                const sid = event.properties.info.id
+                if (sid && stateBackend.loadBinding(sid)) {
+                    releaseBinding(sid, "session deleted", "binding_released")
+                }
+            }
         },
 
         "tool.execute.before": async (input, output) => {

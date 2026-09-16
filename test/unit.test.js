@@ -18,6 +18,7 @@ import {
     escapeRegex,
     atomicWriteFileSync,
     findSessionsForWorktree,
+    parseMergedBranches,
     decidePathAction,
     decideSearchPathAction,
     decideBashAction,
@@ -421,6 +422,41 @@ describe("findSessionsForWorktree", () => {
     test("returns empty array when state has no sessions", () => {
         const result = findSessionsForWorktree({ sessions: {} }, WT_PATH)
         assert.deepEqual(result, [])
+    })
+})
+
+describe("parseMergedBranches", () => {
+    test("strips '*' (current branch) and '+' (linked-worktree) markers", () => {
+        const stdout = "* master\n+ wt/fix-a\n  wt/other\n"
+        const set = parseMergedBranches(stdout)
+        assert.ok(set.has("master"), "must include the current branch")
+        assert.ok(set.has("wt/fix-a"), "must include the linked-worktree branch ( '+' marker, issue #7)")
+        assert.ok(set.has("wt/other"), "must include unmarked branches")
+        assert.equal(set.size, 3)
+    })
+
+    test("same-commit branch in a linked worktree is recognized (reporter's exact case)", () => {
+        const stdout = "* master\n+ wt/review-fixes-batch2\n"
+        const set = parseMergedBranches(stdout)
+        assert.ok(set.has("wt/review-fixes-batch2"))
+    })
+
+    test("skips detached-HEAD pseudo entries", () => {
+        const stdout = "* (HEAD detached at 0123abc)\n  master\n"
+        const set = parseMergedBranches(stdout)
+        assert.ok(set.has("master"))
+        assert.equal(set.size, 1, "detached HEAD line must not become a branch name")
+    })
+
+    test("empty and whitespace-only input yields an empty set", () => {
+        assert.equal(parseMergedBranches("").size, 0)
+        assert.equal(parseMergedBranches("\n\n  \n").size, 0)
+    })
+
+    test("CRLF line endings are tolerated", () => {
+        const set = parseMergedBranches("* master\r\n+ wt/x\r\n")
+        assert.ok(set.has("master"))
+        assert.ok(set.has("wt/x"))
     })
 })
 
