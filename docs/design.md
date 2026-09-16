@@ -331,3 +331,40 @@ for (const d of symlinkDirs || []) {
 - **副作用/破坏性**：默认配置（strictWrites=false, strictGitOps=false, stateLocation="external"）行为完全等价于 v0.3.1，原有 52 case 100% 通过。Strict 模式仅 opt-in 启用。审计/SessionStart 注入仅在 strict 模式下生效。
 - **更简单的替代**：考虑过"延后 removeSyncedLinks 到下个版本"——被否决（Windows 数据丢失风险真实存在，修复成本仅 10 行代码）。
 - **遗漏**：`emergencyDisable` 紧急开关（plan §8.3 提及但 Tier 3 未列）未实现，可作为 v0.5 工作；cross-worktree 写入检测（comparison §4.2 提及但 plan §9 明确不在范围）未实现。
+
+## 17. v0.4.3 增补：inherited 绑定全生命周期（issue #7 跟进）
+
+> **任务来源**: issue #7 2026-09-16 补充评论——v0.4.2 的僵尸绑定修复未覆盖「后台 task 子会话正常完成」主路径（Linux 无崩溃场景 4/4 复现）。
+> **任务内容**: 消除 inherited 子会话绑定残留导致的 merge/cleanup 100% 阻塞，并修复连带发现的 cleanup preview 三异常。
+> **参考文档**:
+> - `https://github.com/earneet/opencode-worktree-isolation/issues/7#issuecomment-5690936847` — 用户反馈原文（复现步骤 + 归因 + 修复建议）
+> - `node_modules/@opencode-ai/plugin/dist/index.d.ts` — Hooks.event 钩子；`node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts` — Event 联合类型（session.idle / session.deleted）
+> **生成日期**: 2026-09-16
+
+### 17.1 根因（两阶段复核确认）
+
+1. **惰性过期对已完成会话永不触发**：`binding_expired` 仅挂在拦截层（该会话下次访问 FS 时），已完成的 task 子会话永不再访问；且插件未订阅任何事件，`inherited: true` 绑定只增不减。
+2. **鸡生蛋**：守卫 `findSessionsForWorktree`（不区分 inherited/存活）阻塞 merge/cleanup 在删除之前，而删除恰是触发过期的前提。
+3. **`git branch --merged` 的 `+` 前缀**：linked worktree 检出的分支在输出中带 `+` 标记，旧解析只剥 `*`，导致**所有**受管 worktree 分支被误判 unmerged——preview 误标 + 非 force cleanup apply 永远跳过（旧测试全用 force:true 故未暴露；已在真实 git 仓库实证）。
+
+### 17.2 关键设计判断
+
+**inherited 绑定按构造必然是 owner 会话的后代**（继承只经 parentID 链发生，独立绑定只能由 `worktree_prepare` 产生且每个 worktree 唯一）。因此「inherited 绑定不阻塞 owner 发起的 merge/cleanup」不是妥协而是语义修正：守卫保护的对象从"任意绑定条目"收窄为"独立会话的绑定"。
+
+**`session.idle` 释放是安全的**：子会话若被续跑（continuation），下次工具调用会经惰性 parent 链重新继承——释放可自愈，无需精确判断"是否真的结束"。
+
+### 17.3 修复清单
+
+| # | 改动 | 位置 |
+|---|---|---|
+| F1 | `event` 钩子：`session.idle` 释放 inherited 绑定、`session.deleted` 释放任意绑定（audit `binding_released`） | index.ts |
+| F2 | merge/cleanup 守卫只被**独立**（非 inherited）绑定阻塞；inherited 绑定当场释放 | index.ts |
+| F3 | merge/cleanup 成功后按路径级联清除全部绑定（含 `inheritCache` 失效）；`materializeBinding` 过期亦级联同路径全部绑定 | index.ts |
+| F4 | cleanup preview 按 worktree 聚合去重（`sessions=N`）、启动时收割目录已消失的绑定；apply 循环按路径去重且以直接绑定为代表 | index.ts |
+| F5 | `parseMergedBranches` / `mergedBranchSet`：剥 `*` 与 `+` 标记（前缀仅在后随空白时剥，避免误伤 `+foo` 类分支名）、跳过 detached HEAD 伪条目 | lib.ts |
+
+### 17.4 已知边界
+
+- 服务重启后未收到 idle 事件的残留 inherited 绑定：不再阻塞（F2），并在 owner 下次 merge/cleanup 时被级联清除（F3）；preview 亦会收割目录缺失者（F4）。
+- owner 在后台子代理仍在运行时合并：子代理下次工具调用将回落主检出（与目录被外部删除后的 v0.4.2 行为一致）。README Limitations 已注明"先收集后台任务结果再合并"。
+- `session.idle` 在 opencode 1.17.4 SDK 中无负载字段，仅 `sessionID`；未来版本若提供 task 状态事件可再精化。

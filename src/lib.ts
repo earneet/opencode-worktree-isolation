@@ -426,6 +426,25 @@ export function findSessionsForWorktree(
         .map(([sid]) => sid)
 }
 
+// `git branch --merged` prefixes the current branch with '*' and branches
+// checked out in linked worktrees with '+'. Managed worktree branches are
+// always in the '+' case at cleanup time (the worktree still exists), so
+// failing to strip '+' made every merged worktree look unmerged (issue #7).
+export function parseMergedBranches(stdout: string): Set<string> {
+    const set = new Set<string>()
+    for (const rawLine of stdout.split(/\r?\n/)) {
+        const name = rawLine.trim().replace(/^[*+](?=\s)/, "").trim()
+        if (!name || name.startsWith("(")) continue
+        set.add(name)
+    }
+    return set
+}
+
+export function mergedBranchSet(repoRoot: string, base: string | null | undefined): Set<string> | null {
+    if (!base) return null
+    return parseMergedBranches(git(["branch", "--merged", base], repoRoot).stdout)
+}
+
 export function removeSyncedLinks(worktreePath: string, symlinkDirs: string[]): void {
     for (const d of symlinkDirs || []) {
         const linkPath = path.join(worktreePath, d)
