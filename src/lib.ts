@@ -652,11 +652,23 @@ export function applyInterception(
         case "write":
         case "edit":
         case "read": {
-            const fp = args.filePath
-            if (typeof fp !== "string") return
+            // V1 tools carry the target in `filePath`; V2 tools use `path`. Detect
+            // which field the calling tool will actually read and rewrite THAT
+            // field — writing back a field the tool ignores silently defeats the
+            // interception.
+            const usesFilePath = typeof args.filePath === "string"
+            const fp = usesFilePath
+                ? args.filePath
+                : typeof args.path === "string"
+                  ? args.path
+                  : undefined
+            if (fp === undefined) return
             const result = decidePathAction(fp, ctx)
             if (result.action === "deny") throw new Error(result.reason)
-            if (result.action === "rewrite" && result.newTarget) args.filePath = result.newTarget
+            if (result.action === "rewrite" && result.newTarget) {
+                if (usesFilePath) args.filePath = result.newTarget
+                else args.path = result.newTarget
+            }
             return
         }
         case "glob":
@@ -671,7 +683,8 @@ export function applyInterception(
             else if (result.action === "rewrite" && result.newPath) args.path = result.newPath
             return
         }
-        case "bash": {
+        case "bash":
+        case "shell": {
             if (worktreePath) {
                 if (args.workdir === undefined && args.cwd === undefined) {
                     args.workdir = worktreePath
@@ -703,6 +716,26 @@ export function applyInterception(
                     strictGitOps: true,
                 })
                 if (bashResult.action === "deny") throw new Error(bashResult.reason)
+            }
+            return
+        }
+        case "patch": {
+            // V2's patch tool edits several files at once via patchText with
+            // repo-relative paths. Rewriting those paths inside a diff payload is
+            // not safe, so deny rather than silently target the main checkout.
+            if (worktreePath) {
+                throw new Error(
+                    `[worktree] the patch tool cannot be redirected into the worktree ` +
+                        `(patchText paths cannot be rewritten safely). ` +
+                        `Use edit or write instead while a worktree is bound.`,
+                )
+            }
+            if (ctx.strictWrites) {
+                throw new Error(
+                    `[worktree] no active worktree binding; the patch tool writes to the main checkout ` +
+                        `and is blocked in strictWrites mode. Prepare a worktree first (worktree_prepare) ` +
+                        `or use edit/write on a whitelisted path.`,
+                )
             }
             return
         }

@@ -302,6 +302,67 @@ test("applyInterception: write with non-string filePath is ignored", () => {
     assert.equal(args.filePath, 123)
 })
 
+test("applyInterception: write with V2-style path field is rewritten in place", () => {
+    const fp = REPO_FWD + "/src/v2file.ts"
+    const args = { path: fp }
+    applyInterception("write", args, INT_CTX)
+    assert.equal(args.path, path.join(WT, path.relative(REPO, fp)))
+    assert.equal(args.filePath, undefined, "must not write a filePath field the V2 tool would not read")
+})
+
+test("applyInterception: edit and read with V2-style path field rewrite path", () => {
+    for (const toolName of ["edit", "read"]) {
+        const fp = REPO_FWD + "/src/v2bar.ts"
+        const args = { path: fp }
+        applyInterception(toolName, args, INT_CTX)
+        assert.equal(args.path, path.join(WT, path.relative(REPO, fp)))
+    }
+})
+
+test("applyInterception: V2 path field also gets .git blocking", () => {
+    const args = { path: REPO_FWD + "/.git/config" }
+    assert.throws(() => applyInterception("write", args, INT_CTX), /\.git paths is blocked/)
+})
+
+test("applyInterception: V1-style filePath wins when both fields present", () => {
+    const fp = REPO_FWD + "/src/dual.ts"
+    const args = { filePath: fp, path: REPO_FWD + "/src/other.ts" }
+    applyInterception("write", args, INT_CTX)
+    assert.equal(args.filePath, path.join(WT, path.relative(REPO, fp)))
+})
+
+test("applyInterception: shell (V2 tool name) with no workdir gets worktree workdir", () => {
+    const args = { command: "ls" }
+    applyInterception("shell", args, INT_CTX)
+    assert.equal(args.workdir, WT)
+})
+
+test("applyInterception: shell command containing repo root is rewritten", () => {
+    const args = { command: "cat " + REPO_FWD + "/file.txt" }
+    applyInterception("shell", args, INT_CTX)
+    assert.ok(!repoRootRegex(REPO).test(args.command), "repo root should be gone")
+    assert.ok(args.command.includes(WT), "worktree path should be present")
+})
+
+test("applyInterception: patch while bound is denied (patchText cannot be rewritten)", () => {
+    const args = { patchText: "*** Update File: src/foo.ts\n@@" }
+    assert.throws(() => applyInterception("patch", args, INT_CTX), /patch tool cannot be redirected/)
+})
+
+test("applyInterception: patch without binding in strictWrites mode is denied", () => {
+    const args = { patchText: "*** Update File: src/foo.ts\n@@" }
+    assert.throws(
+        () => applyInterception("patch", args, { ...INT_CTX, worktreePath: null, strictWrites: true }),
+        /strictWrites/,
+    )
+})
+
+test("applyInterception: patch without binding and non-strict passes through untouched", () => {
+    const args = { patchText: "*** Update File: src/foo.ts\n@@" }
+    applyInterception("patch", args, { ...INT_CTX, worktreePath: null, strictWrites: false })
+    assert.equal(args.patchText, "*** Update File: src/foo.ts\n@@")
+})
+
 describe("atomicWriteFileSync", () => {
     test("writes file correctly", () => {
         const dir = mkdtempSync(path.join(tmpdir(), "awf-"))

@@ -1,483 +1,682 @@
 import { test, describe, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs"
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, mkdirSync, unlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
-import WorktreePlugin from "../dist/index.js"
+import pluginEntry from "../dist/index.js"
 import { git, computeProjectId, loadState, saveState, GitCommonStateBackend, SCHEMA_VERSION, ensureMeta } from "../dist/lib.js"
 
 const testRoot = mkdtempSync(path.join(tmpdir(), "ocwt-lifecycle-"))
-const repoDir = path.join(testRoot, "repo")
-const stateDir = path.join(testRoot, "state")
 const wtRoot = path.join(testRoot, "worktrees")
 
-process.env.OC_WT_STATE_DIR = stateDir
+process.env.OC_WT_STATE_DIR = path.join(testRoot, "state")
 process.env.OC_WT_ROOT = wtRoot
 
-const SESSION = "test-session-1"
-const mockClient = { session: { get: async () => ({ data: { parentID: null } }) } }
-const makeTctx = () => ({ directory: repoDir, sessionID: SESSION, metadata: () => {} })
-
-let plugin
-let worktreePath
-let branchName
-
-after(() => {
-    try {
-        rmSync(testRoot, { recursive: true, force: true })
-    } catch {}
-})
-
-test("setup: create a temp git repo with a base commit", () => {
-    mkdirSync(repoDir, { recursive: true })
-    assert.ok(git(["init"], repoDir).ok, "git init")
-    assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
-    assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
-    assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
-    writeFileSync(path.join(repoDir, "README.md"), "# test repo\n")
-    assert.ok(git(["add", "README.md"], repoDir).ok)
-    assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
-})
-
-test("plugin loads and exposes the three worktree tools", async () => {
-    plugin = await WorktreePlugin({ directory: repoDir, client: mockClient })
-    assert.ok(plugin.tool.worktree_prepare, "worktree_prepare present")
-    assert.ok(plugin.tool.worktree_cleanup, "worktree_cleanup present")
-    assert.ok(plugin.tool.worktree_merge, "worktree_merge present")
-    assert.equal(typeof plugin["tool.execute.before"], "function", "before hook present")
-})
-
-test("worktree_prepare creates a worktree, branch, and binds the session", async () => {
-    const result = await plugin.tool.worktree_prepare.execute({ title: "lifecycle test" }, makeTctx())
-    assert.ok(result.startsWith("✅"), `prepare should succeed, got: ${result}`)
-
-    const wtList = git(["worktree", "list"], repoDir).stdout
-    assert.ok(wtList.split("\n").length >= 2, "should have main + 1 worktree")
-
-    branchName = "wt/lifecycle-test"
-    const branchRes = git(["rev-parse", "--verify", branchName], repoDir)
-    assert.ok(branchRes.ok, `branch ${branchName} should exist`)
-
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    assert.ok(state.sessions[SESSION], "session should be bound")
-    assert.equal(state.sessions[SESSION].branch, branchName)
-    worktreePath = state.sessions[SESSION].path
-    assert.ok(existsSync(worktreePath), `worktree dir should exist: ${worktreePath}`)
-    assert.ok(worktreePath.startsWith(wtRoot), "worktree should be under OC_WT_ROOT")
-})
-
-test("interception hook rewrites a repo-root write path into the worktree", async () => {
-    const output = { args: { filePath: path.join(repoDir, "feature.txt") } }
-    await plugin["tool.execute.before"](
-        { tool: "write", sessionID: SESSION, callID: "c1" },
-        output,
-    )
-    assert.ok(
-        output.args.filePath.startsWith(worktreePath),
-        `filePath should be rewritten into worktree, got: ${output.args.filePath}`,
-    )
-})
-
-test("interception hook injects worktree path for glob without path", async () => {
-    const output = { args: { pattern: "*.js" } }
-    await plugin["tool.execute.before"](
-        { tool: "glob", sessionID: SESSION, callID: "c2" },
-        output,
-    )
-    assert.equal(output.args.path, worktreePath)
-})
-
-test("interception hook is a no-op for an unbound session", async () => {
-    const output = { args: { filePath: path.join(repoDir, "x.txt") } }
-    await plugin["tool.execute.before"](
-        { tool: "write", sessionID: "unbound-session", callID: "c3" },
-        output,
-    )
-    assert.equal(output.args.filePath, path.join(repoDir, "x.txt"), "unbound session path untouched")
-})
-
-test("worktree_merge preview reports the plan without merging", async () => {
-    writeFileSync(path.join(worktreePath, "feature.txt"), "feature work\n")
-    const result = await plugin.tool.worktree_merge.execute({ action: "preview" }, makeTctx())
-    assert.ok(result.includes("Merge preview"), `should be a preview, got: ${result}`)
-    assert.ok(!existsSync(path.join(repoDir, "feature.txt")), "preview must not merge yet")
-})
-
-test("worktree_merge apply merges work, removes worktree, deletes branch, unbinds", async () => {
-    const result = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
-    assert.ok(result.startsWith("✅"), `merge should succeed, got: ${result}`)
-
-    assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merged file should be in repo root")
-    assert.equal(readFileSync(path.join(repoDir, "feature.txt"), "utf8").replace(/\r\n/g, "\n"), "feature work\n")
-
-    assert.ok(!existsSync(worktreePath), "worktree dir should be removed")
-
-    const branchRes = git(["rev-parse", "--verify", branchName], repoDir)
-    assert.ok(!branchRes.ok, `branch ${branchName} should be deleted`)
-
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    assert.ok(!state.sessions[SESSION], "session should be unbound")
-})
-
-test("worktree_cleanup removes a freshly prepared (unmerged) worktree with force", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "cleanup test" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    assert.ok(existsSync(wtPath), "worktree created")
-
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/cleanup-test", force: true },
-        makeTctx(),
-    )
-    assert.ok(result.includes("wt/cleanup-test: removed"), `cleanup should remove, got: ${result}`)
-    assert.ok(!existsSync(wtPath), "worktree dir removed after cleanup")
-    assert.ok(!loadState(pid).sessions[SESSION], "session unbound after cleanup")
-})
-
-test("worktree_cleanup refuses to remove worktree still bound by another session", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "double bound" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const original = state.sessions[SESSION]
-    assert.ok(original, "original session binding must exist")
-
-    state.sessions["other-session-2"] = { ...original }
-    saveState(pid, state)
-
-    const wtPath = state.sessions[SESSION].path
-    assert.ok(existsSync(wtPath), "worktree still present")
-
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/double-bound", force: true },
-        makeTctx(),
-    )
-    assert.ok(
-        result.includes("仍被其他独立会话绑定") && result.includes("other-session-2"),
-        `cleanup should refuse with dangling-session message, got: ${result}`,
-    )
-    assert.ok(existsSync(wtPath), "worktree must NOT be removed when other session is bound")
-
-    const blockedState = loadState(pid)
-    assert.ok(blockedState.sessions[SESSION], "original session binding preserved")
-    assert.ok(blockedState.sessions["other-session-2"], "other session binding preserved")
-
-    delete blockedState.sessions["other-session-2"]
-    saveState(pid, blockedState)
-
-    const cleanup = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/double-bound", force: true },
-        makeTctx(),
-    )
-    assert.ok(cleanup.includes("wt/double-bound: removed"), `cleanup after removing other binding should succeed, got: ${cleanup}`)
-})
-
-test("worktree_merge refuses to merge worktree still bound by another session", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "merge guard" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const original = state.sessions[SESSION]
-    assert.ok(original, "original session binding must exist")
-
-    state.sessions["other-session-3"] = { ...original }
-    saveState(pid, state)
-
-    const wtPath = state.sessions[SESSION].path
-    writeFileSync(path.join(wtPath, "guarded.txt"), "work\n")
-
-    const result = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
-    assert.ok(
-        result.startsWith("❌") && result.includes("仍被其他独立会话绑定") && result.includes("other-session-3"),
-        `merge should refuse with dangling-session error, got: ${result}`,
-    )
-    assert.ok(existsSync(wtPath), "worktree must NOT be removed when other session is bound")
-    assert.ok(!existsSync(path.join(repoDir, "guarded.txt")), "merge must not have happened")
-
-    const finalState = loadState(pid)
-    assert.ok(finalState.sessions[SESSION], "original session binding preserved")
-    assert.ok(finalState.sessions["other-session-3"], "other session binding preserved")
-
-    delete finalState.sessions["other-session-3"]
-    saveState(pid, finalState)
-
-    const mergeOk = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
-    assert.ok(mergeOk.startsWith("✅"), `merge after removing other binding should succeed, got: ${mergeOk}`)
-})
-
-test("merge preview lists the files that will be auto-committed", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "preview list" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    writeFileSync(path.join(wtPath, "uncommitted-a.txt"), "a\n")
-    writeFileSync(path.join(wtPath, "uncommitted-b.txt"), "b\n")
-
-    const result = await plugin.tool.worktree_merge.execute({ action: "preview" }, makeTctx())
-    assert.ok(result.includes("uncommitted-a.txt"), `preview must list uncommitted-a.txt, got:\n${result}`)
-    assert.ok(result.includes("uncommitted-b.txt"), `preview must list uncommitted-b.txt, got:\n${result}`)
-
-    const cleanup = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/preview-list", force: true },
-        makeTctx(),
-    )
-    assert.ok(cleanup.includes("wt/preview-list: removed"), `cleanup should succeed, got: ${cleanup}`)
-})
-
-test("zombie binding: externally deleted worktree dir no longer rewrites paths (issue #7)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "zombie binding" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    assert.ok(existsSync(wtPath), "worktree created")
-
-    rmSync(wtPath, { recursive: true, force: true })
-    assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
-
-    const output = { args: { filePath: path.join(repoDir, "main-checkout.txt") } }
-    await plugin["tool.execute.before"](
-        { tool: "read", sessionID: SESSION, callID: "z1" },
-        output,
-    )
-    assert.equal(
-        output.args.filePath,
-        path.join(repoDir, "main-checkout.txt"),
-        `ghost binding must NOT rewrite paths (got ${output.args.filePath})`,
-    )
-    assert.ok(!loadState(pid).sessions[SESSION], "zombie binding must be auto-cleared")
-})
-
-test("worktree_cleanup prunes and unbinds when the worktree dir is already missing (issue #7)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "missing dir" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    rmSync(wtPath, { recursive: true, force: true })
-    assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
-
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/missing-dir", force: true },
-        makeTctx(),
-    )
-    assert.ok(result.includes("wt/missing-dir: removed"), `cleanup must handle missing dir, got: ${result}`)
-    assert.ok(!loadState(pid).sessions[SESSION], "session unbound after missing-dir cleanup")
-})
-
-test("merge apply survives a path-length deletion failure via fallback deletion (issue #7)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "long path" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    writeFileSync(path.join(wtPath, "feature.txt"), "long path feature\n")
-
-    // Build a directory nest deeper than Windows MAX_PATH (260). Node's fs handles
-    // long paths fine when creating them, but `git worktree remove` does not.
-    const seg = "0123456789"
-    let deep = wtPath
-    for (let i = 0; i < 30; i++) deep = path.join(deep, `d-${seg}`)
-    mkdirSync(deep, { recursive: true })
-    writeFileSync(path.join(deep, "leaf.txt"), "deep\n")
-    assert.ok(deep.length > 300, `test requires a >300-char path, got ${deep.length}`)
-
-    const result = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
-    assert.ok(result.startsWith("✅"), `merge must succeed even when removal needs the fallback, got:\n${result}`)
-    assert.ok(!existsSync(wtPath), "worktree dir must be removed by the fallback")
-    assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merge result must land in repo root")
-    assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound after fallback cleanup")
-})
-
-test("inherited (sub-agent) zombie bindings do not block merge apply and are cascade-cleared (issue #7 follow-up)", async () => {
-    assert.equal(typeof plugin.event, "function", "plugin must register the event hook")
-
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "inherited merge" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const owner = state.sessions[SESSION]
-    assert.ok(owner, "owner binding must exist")
-    const wtPath = owner.path
-    for (const sid of ["task-child-1", "task-child-2"]) {
-        state.sessions[sid] = { ...owner, inherited: true }
+function makePushableStream() {
+    const queue = []
+    const waiters = []
+    let done = false
+    const end = () => {
+        done = true
+        while (waiters.length) waiters.shift()(undefined)
     }
-    saveState(pid, state)
-    writeFileSync(path.join(wtPath, "inh-merge.txt"), "inherited merge work\n")
-
-    const result = await plugin.tool.worktree_merge.execute({ action: "apply" }, makeTctx())
-    assert.ok(
-        result.startsWith("✅"),
-        `merge must not be blocked by inherited zombie bindings, got:\n${result}`,
-    )
-    assert.ok(existsSync(path.join(repoDir, "inh-merge.txt")), "merged file must land in repo root")
-    assert.ok(!existsSync(wtPath), "worktree dir must be removed")
-    assert.ok(!git(["rev-parse", "--verify", "wt/inherited-merge"], repoDir).ok, "branch must be deleted")
-
-    const after = loadState(pid)
-    assert.ok(!after.sessions[SESSION], "owner binding must be cleared")
-    assert.ok(!after.sessions["task-child-1"], "inherited binding 1 must be cascade-cleared")
-    assert.ok(!after.sessions["task-child-2"], "inherited binding 2 must be cascade-cleared")
-})
-
-test("inherited (sub-agent) zombie bindings do not block cleanup apply (issue #7 follow-up)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "inherited cleanup" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const owner = state.sessions[SESSION]
-    assert.ok(owner, "owner binding must exist")
-    for (const sid of ["task-child-3", "task-child-4"]) {
-        state.sessions[sid] = { ...owner, inherited: true }
+    const push = (ev) => {
+        if (done) return
+        if (waiters.length) waiters.shift()(ev)
+        else queue.push(ev)
     }
-    saveState(pid, state)
-
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/inherited-cleanup", force: true },
-        makeTctx(),
-    )
-    assert.ok(
-        result.includes("wt/inherited-cleanup: removed"),
-        `cleanup must not be blocked by inherited zombie bindings, got:\n${result}`,
-    )
-    assert.equal(
-        result.split("wt/inherited-cleanup: removed").length - 1,
-        1,
-        `the worktree must be processed exactly once (deduped), got:\n${result}`,
-    )
-    assert.ok(!existsSync(owner.path), "worktree dir must be removed")
-
-    const after = loadState(pid)
-    assert.ok(!after.sessions[SESSION], "owner binding must be cleared")
-    assert.ok(!after.sessions["task-child-3"], "inherited binding 1 must be cleared")
-    assert.ok(!after.sessions["task-child-4"], "inherited binding 2 must be cleared")
-})
-
-test("session.idle event releases inherited bindings but keeps the owner binding (issue #7 follow-up)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "idle release" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const owner = state.sessions[SESSION]
-    state.sessions["task-child-idle"] = { ...owner, inherited: true }
-    saveState(pid, state)
-
-    await plugin.event({ event: { type: "session.idle", properties: { sessionID: "task-child-idle" } } })
-    let after = loadState(pid)
-    assert.ok(!after.sessions["task-child-idle"], "inherited binding must be released on session.idle")
-    assert.ok(after.sessions[SESSION], "owner binding must survive session.idle")
-    assert.ok(existsSync(owner.path), "worktree must be untouched")
-
-    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION } } })
-    after = loadState(pid)
-    assert.ok(after.sessions[SESSION], "owner going idle must NOT release its own (direct) binding")
-
-    const cleanup = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/idle-release", force: true },
-        makeTctx(),
-    )
-    assert.ok(cleanup.includes("wt/idle-release: removed"), `cleanup should succeed, got: ${cleanup}`)
-})
-
-test("session.deleted event releases any binding including the owner's (issue #7 follow-up)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "deleted release" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    assert.ok(loadState(pid).sessions[SESSION], "owner binding must exist")
-
-    await plugin.event({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } })
-    assert.ok(!loadState(pid).sessions[SESSION], "owner binding must be released on session.deleted")
-
-    await plugin.event({ event: { type: "session.deleted", properties: { info: { id: "never-bound" } } } })
-    assert.ok(true, "event for an unbound session must be a no-op")
-
-    rmSync(wtPath, { recursive: true, force: true })
-    git(["worktree", "prune"], repoDir)
-    git(["branch", "-D", "wt/deleted-release"], repoDir)
-})
-
-test("cleanup preview aggregates all bindings of one worktree into a single line (issue #7 follow-up)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "dedup preview" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const state = loadState(pid)
-    const owner = state.sessions[SESSION]
-    for (const sid of ["task-child-5", "task-child-6"]) {
-        state.sessions[sid] = { ...owner, inherited: true }
+    const stream = {
+        [Symbol.asyncIterator]: () => ({
+            next: () => {
+                if (queue.length) return Promise.resolve({ value: queue.shift(), done: false })
+                if (done) return Promise.resolve({ done: true })
+                return new Promise((resolve) => waiters.push(resolve)).then((v) =>
+                    v === undefined ? { done: true } : { value: v, done: false },
+                )
+            },
+        }),
     }
-    saveState(pid, state)
+    return { push, end, stream }
+}
 
-    const result = await plugin.tool.worktree_cleanup.execute({ action: "preview" }, makeTctx())
-    const occurrences = result.split("wt/dedup-preview").length - 1
-    assert.equal(occurrences, 1, `worktree must appear exactly once in preview, got ${occurrences}:\n${result}`)
-    assert.ok(result.includes("sessions=3"), `preview must show the binding count, got:\n${result}`)
+// Both harnesses expose the same surface so every lifecycle test below runs
+// unchanged against the V1 entry (.server, V1 hook shapes) and the V2 entry
+// (.setup with a mocked plugin context, V2 hook/event shapes).
+function makeV1Harness(repoDir, SESSION) {
+    let hooks = null
+    const updates = []
+    const mockClient = { session: { get: async () => ({ data: { parentID: null } }) } }
+    const makeTctx = (sid) => ({
+        directory: repoDir,
+        sessionID: sid,
+        metadata: (m) => {
+            updates.push(m)
+        },
+    })
+    return {
+        kind: "v1",
+        updates,
+        async init() {
+            hooks = await pluginEntry.server({ directory: repoDir, client: mockClient })
+            return hooks
+        },
+        get toolNames() {
+            return Object.keys(hooks.tool)
+        },
+        prepare: (args, sid = SESSION) => hooks.tool.worktree_prepare.execute(args, makeTctx(sid)),
+        cleanupWorktrees: (args, sid = SESSION) => hooks.tool.worktree_cleanup.execute(args, makeTctx(sid)),
+        merge: (args, sid = SESSION) => hooks.tool.worktree_merge.execute(args, makeTctx(sid)),
+        allow: (args, sid = SESSION) => hooks.tool.worktree_allow.execute(args, makeTctx(sid)),
+        async intercept(tool, args, sid = SESSION) {
+            await hooks["tool.execute.before"]({ tool, sessionID: sid, callID: "c" }, { args })
+        },
+        async systemPrompt(sid = SESSION) {
+            const output = { system: [] }
+            await hooks["experimental.chat.system.transform"]({ sessionID: sid }, output)
+            return output.system.map((p) => (typeof p === "string" ? p : p.text))
+        },
+        async emit(type, payload) {
+            const properties = type === "session.deleted" ? { info: { id: payload.sessionID } } : payload
+            await hooks.event({ event: { type, properties } })
+        },
+        async dispose() {},
+    }
+}
 
-    const cleanup = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/dedup-preview", force: true },
-        makeTctx(),
-    )
-    assert.ok(cleanup.includes("wt/dedup-preview: removed"), `cleanup should succeed, got: ${cleanup}`)
-})
+function makeV2Harness(repoDir, SESSION) {
+    const tools = new Map()
+    const toolHooks = new Map()
+    const sessionHooks = new Map()
+    const updates = []
+    const pushable = makePushableStream()
+    const callCtx = (sid) => ({ sessionID: sid, agent: "build", messageID: "msg_1", id: "call_1" })
+    const ctx = {
+        location: { directory: repoDir, project: { id: "test-project" } },
+        session: {
+            get: async ({ sessionID }) => ({ id: sessionID, parentID: null }),
+            update: async (input) => {
+                updates.push(input)
+            },
+            hook: async (name, cb) => {
+                sessionHooks.set(name, cb)
+                return { dispose: async () => {} }
+            },
+        },
+        tool: {
+            transform: async (cb) => {
+                cb({
+                    add: (t) => {
+                        tools.set(t.name, t)
+                    },
+                })
+                return { dispose: async () => {} }
+            },
+            hook: async (name, cb) => {
+                toolHooks.set(name, cb)
+                return { dispose: async () => {} }
+            },
+        },
+        event: {
+            subscribe: ({ signal }) => {
+                if (signal?.addEventListener) signal.addEventListener("abort", () => pushable.end())
+                return pushable.stream
+            },
+        },
+    }
+    // V2 tool executors return Tool.Result ({ content }); the harness normalizes
+    // to the plain string both generations share.
+    const unwrap = (promise) =>
+        promise.then((result) => (result && typeof result.content === "string" ? result.content : result))
+    const harness = {
+        kind: "v2",
+        updates,
+        async init() {
+            const cleanup = await pluginEntry.setup(ctx)
+            harness.dispose = async () => {
+                await cleanup()
+            }
+            return cleanup
+        },
+        get toolNames() {
+            return [...tools.keys()]
+        },
+        prepare: (args, sid = SESSION) => unwrap(tools.get("worktree_prepare").execute(args, callCtx(sid))),
+        cleanupWorktrees: (args, sid = SESSION) => unwrap(tools.get("worktree_cleanup").execute(args, callCtx(sid))),
+        merge: (args, sid = SESSION) => unwrap(tools.get("worktree_merge").execute(args, callCtx(sid))),
+        allow: (args, sid = SESSION) => unwrap(tools.get("worktree_allow").execute(args, callCtx(sid))),
+        async intercept(tool, args, sid = SESSION) {
+            await toolHooks.get("execute.before")({ tool, ...callCtx(sid), input: args })
+        },
+        async systemPrompt(sid = SESSION) {
+            const event = {
+                sessionID: sid,
+                agent: "build",
+                model: { providerID: "test", id: "model" },
+                system: [],
+                messages: [],
+                options: {},
+                tools: {},
+            }
+            await sessionHooks.get("context")(event)
+            return event.system.map((p) => p.text)
+        },
+        async emit(type, payload, locationDirectory = repoDir) {
+            pushable.push({ type, data: payload, location: { directory: locationDirectory } })
+            await new Promise((resolve) => setImmediate(resolve))
+        },
+        async dispose() {},
+    }
+    return harness
+}
 
-test("branch merged into base is detected as merged despite the linked-worktree '+' marker (issue #7 follow-up)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "plus prefix" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    writeFileSync(path.join(wtPath, "plus.txt"), "plus prefix work\n")
-    assert.ok(git(["add", "-A"], wtPath).ok)
-    assert.ok(git(["commit", "-m", "work"], wtPath).ok)
-    // Merge the branch from the MAIN checkout while the worktree still exists:
-    // the branch stays checked out in a linked worktree, so `git branch --merged`
-    // lists it with a '+' marker.
-    assert.ok(git(["merge", "--no-ff", "-m", "merge plus", "wt/plus-prefix"], repoDir).ok)
+const harnessMakers = [
+    ["v1", makeV1Harness],
+    ["v2", makeV2Harness],
+]
 
-    const preview = await plugin.tool.worktree_cleanup.execute({ action: "preview" }, makeTctx())
-    const line = preview.split("\n").find((l) => l.includes("wt/plus-prefix"))
-    assert.ok(line, `preview must list wt/plus-prefix, got:\n${preview}`)
-    assert.match(line, /\bmerged\b/, `merged branch must be labeled merged, got line: ${line}`)
-    assert.doesNotMatch(line, /unmerged/, `merged branch must NOT be labeled unmerged, got line: ${line}`)
+for (const [label, makeHarness] of harnessMakers) {
+    describe(`full lifecycle (${label} entry)`, () => {
+        const repoDir = path.join(testRoot, `repo-${label}`)
+        const SESSION = `test-session-${label}`
+        let h
+        let worktreePath
+        let branchName
 
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/plus-prefix" },
-        makeTctx(),
-    )
-    assert.ok(
-        result.includes("wt/plus-prefix: removed"),
-        `cleanup apply WITHOUT force must remove a merged worktree, got:\n${result}`,
-    )
-    assert.ok(!existsSync(wtPath), "worktree dir must be removed")
-    assert.ok(!git(["rev-parse", "--verify", "wt/plus-prefix"], repoDir).ok, "branch must be deleted")
-    assert.ok(!loadState(pid).sessions[SESSION], "binding must be cleared")
-})
+        before(async () => {
+            mkdirSync(repoDir, { recursive: true })
+            assert.ok(git(["init"], repoDir).ok, "git init")
+            assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
+            assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
+            assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
+            writeFileSync(path.join(repoDir, "README.md"), "# test repo\n")
+            assert.ok(git(["add", "README.md"], repoDir).ok)
+            assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
+            h = makeHarness(repoDir, SESSION)
+            await h.init()
+        })
 
-test("cleanup apply without force still refuses an unmerged worktree (regression guard)", async () => {
-    const prep = await plugin.tool.worktree_prepare.execute({ title: "unmerged keep" }, makeTctx())
-    assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
-    const pid = computeProjectId(repoDir)
-    const wtPath = loadState(pid).sessions[SESSION].path
-    writeFileSync(path.join(wtPath, "unmerged.txt"), "not merged yet\n")
-    assert.ok(git(["add", "-A"], wtPath).ok)
-    assert.ok(git(["commit", "-m", "wip"], wtPath).ok)
+        test(`loads and exposes the four worktree tools (${label})`, () => {
+            assert.deepEqual(
+                [...h.toolNames].sort(),
+                ["worktree_allow", "worktree_cleanup", "worktree_merge", "worktree_prepare"],
+            )
+        })
 
-    const result = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/unmerged-keep" },
-        makeTctx(),
-    )
-    assert.ok(
-        result.includes("unmerged") && !result.includes("wt/unmerged-keep: removed"),
-        `unmerged worktree must be skipped without force, got:\n${result}`,
-    )
-    assert.ok(existsSync(wtPath), "worktree must still exist")
+        test(`worktree_prepare creates a worktree, branch, and binds the session (${label})`, async () => {
+            const result = await h.prepare({ title: "lifecycle test" })
+            assert.ok(result.startsWith("✅"), `prepare should succeed, got: ${result}`)
 
-    const cleanup = await plugin.tool.worktree_cleanup.execute(
-        { action: "apply", branch: "wt/unmerged-keep", force: true },
-        makeTctx(),
-    )
-    assert.ok(cleanup.includes("wt/unmerged-keep: removed"), `force cleanup should succeed, got: ${cleanup}`)
+            const wtList = git(["worktree", "list"], repoDir).stdout
+            assert.ok(wtList.split("\n").length >= 2, "should have main + 1 worktree")
+
+            branchName = "wt/lifecycle-test"
+            const branchRes = git(["rev-parse", "--verify", branchName], repoDir)
+            assert.ok(branchRes.ok, `branch ${branchName} should exist`)
+
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            assert.ok(state.sessions[SESSION], "session should be bound")
+            assert.equal(state.sessions[SESSION].branch, branchName)
+            worktreePath = state.sessions[SESSION].path
+            assert.ok(existsSync(worktreePath), `worktree dir should exist: ${worktreePath}`)
+            assert.ok(worktreePath.startsWith(wtRoot), "worktree should be under OC_WT_ROOT")
+        })
+
+        test(`interception hook rewrites a repo-root write path into the worktree (${label})`, async () => {
+            const fileField = h.kind === "v1" ? "filePath" : "path"
+            const args = { [fileField]: path.join(repoDir, "feature.txt") }
+            await h.intercept("write", args)
+            assert.ok(
+                args[fileField].startsWith(worktreePath),
+                `${fileField} should be rewritten into worktree, got: ${args[fileField]}`,
+            )
+        })
+
+        test(`interception hook injects worktree path for glob without path (${label})`, async () => {
+            const args = { pattern: "*.js" }
+            await h.intercept("glob", args)
+            assert.equal(args.path, worktreePath)
+        })
+
+        test(`interception hook is a no-op for an unbound session (${label})`, async () => {
+            const fileField = h.kind === "v1" ? "filePath" : "path"
+            const args = { [fileField]: path.join(repoDir, "x.txt") }
+            await h.intercept("write", args, "unbound-session")
+            assert.equal(args[fileField], path.join(repoDir, "x.txt"), "unbound session path untouched")
+        })
+
+        test(`interception hook denies patch while a worktree is bound (${label})`, async () => {
+            const args = { patchText: "*** Update File: src/foo.ts\n@@" }
+            await assert.rejects(() => h.intercept("patch", args), /patch tool cannot be redirected/)
+        })
+
+        test(`system prompt announces the active worktree (${label})`, async () => {
+            const parts = await h.systemPrompt(SESSION)
+            assert.ok(parts.length > 0, "bound session must receive a system prompt part")
+            const text = parts.join("\n")
+            assert.ok(text.includes("ACTIVE WORKTREE"), `prompt must announce the worktree, got: ${text}`)
+            assert.ok(text.includes(worktreePath), "prompt must contain the worktree path")
+            assert.ok(text.includes(branchName), "prompt must contain the branch name")
+
+            const unbound = await h.systemPrompt("never-bound-session")
+            assert.equal(unbound.length, 0, "unbound session must get no prompt when nudges are off")
+        })
+
+        test(`worktree_merge preview reports the plan without merging (${label})`, async () => {
+            writeFileSync(path.join(worktreePath, "feature.txt"), "feature work\n")
+            const result = await h.merge({ action: "preview" })
+            assert.ok(result.includes("Merge preview"), `should be a preview, got: ${result}`)
+            assert.ok(!existsSync(path.join(repoDir, "feature.txt")), "preview must not merge yet")
+        })
+
+        test(`worktree_merge apply merges work, removes worktree, deletes branch, unbinds (${label})`, async () => {
+            const result = await h.merge({ action: "apply" })
+            assert.ok(result.startsWith("✅"), `merge should succeed, got: ${result}`)
+
+            assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merged file should be in repo root")
+            assert.equal(readFileSync(path.join(repoDir, "feature.txt"), "utf8").replace(/\r\n/g, "\n"), "feature work\n")
+
+            assert.ok(!existsSync(worktreePath), "worktree dir should be removed")
+
+            const branchRes = git(["rev-parse", "--verify", branchName], repoDir)
+            assert.ok(!branchRes.ok, `branch ${branchName} should be deleted`)
+
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            assert.ok(!state.sessions[SESSION], "session should be unbound")
+        })
+
+        test(`worktree_cleanup removes a freshly prepared (unmerged) worktree with force (${label})`, async () => {
+            const prep = await h.prepare({ title: "cleanup test" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            assert.ok(existsSync(wtPath), "worktree created")
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/cleanup-test", force: true })
+            assert.ok(result.includes("wt/cleanup-test: removed"), `cleanup should remove, got: ${result}`)
+            assert.ok(!existsSync(wtPath), "worktree dir removed after cleanup")
+            assert.ok(!loadState(pid).sessions[SESSION], "session unbound after cleanup")
+        })
+
+        test(`worktree_cleanup refuses to remove worktree still bound by another session (${label})`, async () => {
+            const prep = await h.prepare({ title: "double bound" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const original = state.sessions[SESSION]
+            assert.ok(original, "original session binding must exist")
+
+            state.sessions["other-session-2"] = { ...original }
+            saveState(pid, state)
+
+            const wtPath = state.sessions[SESSION].path
+            assert.ok(existsSync(wtPath), "worktree still present")
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/double-bound", force: true })
+            assert.ok(
+                result.includes("仍被其他独立会话绑定") && result.includes("other-session-2"),
+                `cleanup should refuse with dangling-session message, got: ${result}`,
+            )
+            assert.ok(existsSync(wtPath), "worktree must NOT be removed when other session is bound")
+
+            const blockedState = loadState(pid)
+            assert.ok(blockedState.sessions[SESSION], "original session binding preserved")
+            assert.ok(blockedState.sessions["other-session-2"], "other session binding preserved")
+
+            delete blockedState.sessions["other-session-2"]
+            saveState(pid, blockedState)
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/double-bound", force: true })
+            assert.ok(cleanup.includes("wt/double-bound: removed"), `cleanup after removing other binding should succeed, got: ${cleanup}`)
+        })
+
+        test(`worktree_merge refuses to merge worktree still bound by another session (${label})`, async () => {
+            const prep = await h.prepare({ title: "merge guard" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const original = state.sessions[SESSION]
+            assert.ok(original, "original session binding must exist")
+
+            state.sessions["other-session-3"] = { ...original }
+            saveState(pid, state)
+
+            const wtPath = state.sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "guarded.txt"), "work\n")
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(
+                result.startsWith("❌") && result.includes("仍被其他独立会话绑定") && result.includes("other-session-3"),
+                `merge should refuse with dangling-session error, got: ${result}`,
+            )
+            assert.ok(existsSync(wtPath), "worktree must NOT be removed when other session is bound")
+            assert.ok(!existsSync(path.join(repoDir, "guarded.txt")), "merge must not have happened")
+
+            const finalState = loadState(pid)
+            assert.ok(finalState.sessions[SESSION], "original session binding preserved")
+            assert.ok(finalState.sessions["other-session-3"], "other session binding preserved")
+
+            delete finalState.sessions["other-session-3"]
+            saveState(pid, finalState)
+
+            const mergeOk = await h.merge({ action: "apply" })
+            assert.ok(mergeOk.startsWith("✅"), `merge after removing other binding should succeed, got: ${mergeOk}`)
+        })
+
+        test(`merge preview lists the files that will be auto-committed (${label})`, async () => {
+            const prep = await h.prepare({ title: "preview list" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "uncommitted-a.txt"), "a\n")
+            writeFileSync(path.join(wtPath, "uncommitted-b.txt"), "b\n")
+
+            const result = await h.merge({ action: "preview" })
+            assert.ok(result.includes("uncommitted-a.txt"), `preview must list uncommitted-a.txt, got:\n${result}`)
+            assert.ok(result.includes("uncommitted-b.txt"), `preview must list uncommitted-b.txt, got:\n${result}`)
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/preview-list", force: true })
+            assert.ok(cleanup.includes("wt/preview-list: removed"), `cleanup should succeed, got: ${cleanup}`)
+        })
+
+        test(`zombie binding: externally deleted worktree dir no longer rewrites paths (issue #7) (${label})`, async () => {
+            const prep = await h.prepare({ title: "zombie binding" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            assert.ok(existsSync(wtPath), "worktree created")
+
+            rmSync(wtPath, { recursive: true, force: true })
+            assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
+
+            const fileField = h.kind === "v1" ? "filePath" : "path"
+            const args = { [fileField]: path.join(repoDir, "main-checkout.txt") }
+            await h.intercept("read", args)
+            assert.equal(
+                args[fileField],
+                path.join(repoDir, "main-checkout.txt"),
+                `ghost binding must NOT rewrite paths (got ${args[fileField]})`,
+            )
+            assert.ok(!loadState(pid).sessions[SESSION], "zombie binding must be auto-cleared")
+        })
+
+        test(`worktree_cleanup prunes and unbinds when the worktree dir is already missing (issue #7) (${label})`, async () => {
+            const prep = await h.prepare({ title: "missing dir" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            rmSync(wtPath, { recursive: true, force: true })
+            assert.ok(!existsSync(wtPath), "worktree dir externally deleted")
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/missing-dir", force: true })
+            assert.ok(result.includes("wt/missing-dir: removed"), `cleanup must handle missing dir, got: ${result}`)
+            assert.ok(!loadState(pid).sessions[SESSION], "session unbound after missing-dir cleanup")
+        })
+
+        test(`merge apply survives a path-length deletion failure via fallback deletion (issue #7) (${label})`, async () => {
+            const prep = await h.prepare({ title: "long path" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "feature.txt"), "long path feature\n")
+
+            // Build a directory nest deeper than Windows MAX_PATH (260). Node's fs handles
+            // long paths fine when creating them, but `git worktree remove` does not.
+            const seg = "0123456789"
+            let deep = wtPath
+            for (let i = 0; i < 30; i++) deep = path.join(deep, `d-${seg}`)
+            mkdirSync(deep, { recursive: true })
+            writeFileSync(path.join(deep, "leaf.txt"), "deep\n")
+            assert.ok(deep.length > 300, `test requires a >300-char path, got ${deep.length}`)
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(result.startsWith("✅"), `merge must succeed even when removal needs the fallback, got:\n${result}`)
+            assert.ok(!existsSync(wtPath), "worktree dir must be removed by the fallback")
+            assert.ok(existsSync(path.join(repoDir, "feature.txt")), "merge result must land in repo root")
+            assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound after fallback cleanup")
+        })
+
+        test(`inherited (sub-agent) zombie bindings do not block merge apply and are cascade-cleared (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "inherited merge" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const owner = state.sessions[SESSION]
+            assert.ok(owner, "owner binding must exist")
+            const wtPath = owner.path
+            for (const sid of ["task-child-1", "task-child-2"]) {
+                state.sessions[sid] = { ...owner, inherited: true }
+            }
+            saveState(pid, state)
+            writeFileSync(path.join(wtPath, "inh-merge.txt"), "inherited merge work\n")
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(
+                result.startsWith("✅"),
+                `merge must not be blocked by inherited zombie bindings, got:\n${result}`,
+            )
+            assert.ok(existsSync(path.join(repoDir, "inh-merge.txt")), "merged file must land in repo root")
+            assert.ok(!existsSync(wtPath), "worktree dir must be removed")
+            assert.ok(!git(["rev-parse", "--verify", "wt/inherited-merge"], repoDir).ok, "branch must be deleted")
+
+            const after = loadState(pid)
+            assert.ok(!after.sessions[SESSION], "owner binding must be cleared")
+            assert.ok(!after.sessions["task-child-1"], "inherited binding 1 must be cascade-cleared")
+            assert.ok(!after.sessions["task-child-2"], "inherited binding 2 must be cascade-cleared")
+        })
+
+        test(`inherited (sub-agent) zombie bindings do not block cleanup apply (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "inherited cleanup" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const owner = state.sessions[SESSION]
+            assert.ok(owner, "owner binding must exist")
+            for (const sid of ["task-child-3", "task-child-4"]) {
+                state.sessions[sid] = { ...owner, inherited: true }
+            }
+            saveState(pid, state)
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/inherited-cleanup", force: true })
+            assert.ok(
+                result.includes("wt/inherited-cleanup: removed"),
+                `cleanup must not be blocked by inherited zombie bindings, got:\n${result}`,
+            )
+            assert.equal(
+                result.split("wt/inherited-cleanup: removed").length - 1,
+                1,
+                `the worktree must be processed exactly once (deduped), got:\n${result}`,
+            )
+            assert.ok(!existsSync(owner.path), "worktree dir must be removed")
+
+            const after = loadState(pid)
+            assert.ok(!after.sessions[SESSION], "owner binding must be cleared")
+            assert.ok(!after.sessions["task-child-3"], "inherited binding 1 must be cleared")
+            assert.ok(!after.sessions["task-child-4"], "inherited binding 2 must be cleared")
+        })
+
+        test(`session.idle event releases inherited bindings but keeps the owner binding (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "idle release" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const owner = state.sessions[SESSION]
+            state.sessions["task-child-idle"] = { ...owner, inherited: true }
+            saveState(pid, state)
+
+            await h.emit("session.idle", { sessionID: "task-child-idle" })
+            let after = loadState(pid)
+            assert.ok(!after.sessions["task-child-idle"], "inherited binding must be released on session.idle")
+            assert.ok(after.sessions[SESSION], "owner binding must survive session.idle")
+            assert.ok(existsSync(owner.path), "worktree must be untouched")
+
+            await h.emit("session.idle", { sessionID: SESSION })
+            after = loadState(pid)
+            assert.ok(after.sessions[SESSION], "owner going idle must NOT release its own (direct) binding")
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/idle-release", force: true })
+            assert.ok(cleanup.includes("wt/idle-release: removed"), `cleanup should succeed, got: ${cleanup}`)
+        })
+
+        test(`session.deleted event releases any binding including the owner's (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "deleted release" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            assert.ok(loadState(pid).sessions[SESSION], "owner binding must exist")
+
+            await h.emit("session.deleted", { sessionID: SESSION })
+            assert.ok(!loadState(pid).sessions[SESSION], "owner binding must be released on session.deleted")
+
+            await h.emit("session.deleted", { sessionID: "never-bound" })
+            assert.ok(true, "event for an unbound session must be a no-op")
+
+            rmSync(wtPath, { recursive: true, force: true })
+            git(["worktree", "prune"], repoDir)
+            git(["branch", "-D", "wt/deleted-release"], repoDir)
+        })
+
+        test(`cleanup preview aggregates all bindings of one worktree into a single line (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "dedup preview" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const state = loadState(pid)
+            const owner = state.sessions[SESSION]
+            for (const sid of ["task-child-5", "task-child-6"]) {
+                state.sessions[sid] = { ...owner, inherited: true }
+            }
+            saveState(pid, state)
+
+            const result = await h.cleanupWorktrees({ action: "preview" })
+            const occurrences = result.split("wt/dedup-preview").length - 1
+            assert.equal(occurrences, 1, `worktree must appear exactly once in preview, got ${occurrences}:\n${result}`)
+            assert.ok(result.includes("sessions=3"), `preview must show the binding count, got:\n${result}`)
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/dedup-preview", force: true })
+            assert.ok(cleanup.includes("wt/dedup-preview: removed"), `cleanup should succeed, got: ${cleanup}`)
+        })
+
+        test(`branch merged into base is detected as merged despite the linked-worktree '+' marker (issue #7 follow-up) (${label})`, async () => {
+            const prep = await h.prepare({ title: "plus prefix" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "plus.txt"), "plus prefix work\n")
+            assert.ok(git(["add", "-A"], wtPath).ok)
+            assert.ok(git(["commit", "-m", "work"], wtPath).ok)
+            // Merge the branch from the MAIN checkout while the worktree still exists:
+            // the branch stays checked out in a linked worktree, so `git branch --merged`
+            // lists it with a '+' marker.
+            assert.ok(git(["merge", "--no-ff", "-m", "merge plus", "wt/plus-prefix"], repoDir).ok)
+
+            const preview = await h.cleanupWorktrees({ action: "preview" })
+            const line = preview.split("\n").find((l) => l.includes("wt/plus-prefix"))
+            assert.ok(line, `preview must list wt/plus-prefix, got:\n${preview}`)
+            assert.match(line, /\bmerged\b/, `merged branch must be labeled merged, got line: ${line}`)
+            assert.doesNotMatch(line, /unmerged/, `merged branch must NOT be labeled unmerged, got line: ${line}`)
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/plus-prefix" })
+            assert.ok(
+                result.includes("wt/plus-prefix: removed"),
+                `cleanup apply WITHOUT force must remove a merged worktree, got:\n${result}`,
+            )
+            assert.ok(!existsSync(wtPath), "worktree dir must be removed")
+            assert.ok(!git(["rev-parse", "--verify", "wt/plus-prefix"], repoDir).ok, "branch must be deleted")
+            assert.ok(!loadState(pid).sessions[SESSION], "binding must be cleared")
+        })
+
+        test(`cleanup apply without force still refuses an unmerged worktree (regression guard) (${label})`, async () => {
+            const prep = await h.prepare({ title: "unmerged keep" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "unmerged.txt"), "not merged yet\n")
+            assert.ok(git(["add", "-A"], wtPath).ok)
+            assert.ok(git(["commit", "-m", "wip"], wtPath).ok)
+
+            const result = await h.cleanupWorktrees({ action: "apply", branch: "wt/unmerged-keep" })
+            assert.ok(
+                result.includes("unmerged") && !result.includes("wt/unmerged-keep: removed"),
+                `unmerged worktree must be skipped without force, got:\n${result}`,
+            )
+            assert.ok(existsSync(wtPath), "worktree must still exist")
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/unmerged-keep", force: true })
+            assert.ok(cleanup.includes("wt/unmerged-keep: removed"), `force cleanup should succeed, got: ${cleanup}`)
+        })
+    })
+}
+
+describe("v2 entry specifics", () => {
+    const repoDir = path.join(testRoot, "repo-v2-specific")
+    const SESSION = "v2-specific-session"
+    let h
+
+    before(async () => {
+        mkdirSync(repoDir, { recursive: true })
+        assert.ok(git(["init"], repoDir).ok, "git init")
+        assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
+        assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
+        assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
+        writeFileSync(path.join(repoDir, "README.md"), "# test repo\n")
+        assert.ok(git(["add", "README.md"], repoDir).ok)
+        assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
+        h = makeV2Harness(repoDir, SESSION)
+        await h.init()
+    })
+
+    test("prepare sets the session title via ctx.session.update", async () => {
+        const result = await h.prepare({ title: "title update" })
+        assert.ok(result.startsWith("✅"), `prepare should succeed, got: ${result}`)
+        const pid = computeProjectId(repoDir)
+        assert.ok(loadState(pid).sessions[SESSION], "binding must exist")
+        const titleUpdate = h.updates.find((u) => typeof u.title === "string" && u.title.includes("wt/title-update"))
+        assert.ok(
+            titleUpdate,
+            `session.update must be called with the branch title, got: ${JSON.stringify(h.updates)}`,
+        )
+        assert.equal(titleUpdate.sessionID, SESSION)
+    })
+
+    test("events from a different location directory are ignored", async () => {
+        const pid = computeProjectId(repoDir)
+        const state = loadState(pid)
+        const owner = state.sessions[SESSION]
+        state.sessions["v2-child-foreign"] = { ...owner, inherited: true }
+        saveState(pid, state)
+
+        await h.emit("session.idle", { sessionID: "v2-child-foreign" }, path.resolve("/tmp/other-location"))
+        const after = loadState(pid)
+        assert.ok(
+            after.sessions["v2-child-foreign"],
+            "idle event from another location must NOT release the inherited binding",
+        )
+
+        delete after.sessions["v2-child-foreign"]
+        saveState(pid, after)
+    })
+
+    test("setup cleanup stops the event subscription", async () => {
+        const pid = computeProjectId(repoDir)
+        const state = loadState(pid)
+        const owner = state.sessions[SESSION]
+        state.sessions["v2-child-after-dispose"] = { ...owner, inherited: true }
+        saveState(pid, state)
+
+        await h.dispose()
+        await h.emit("session.idle", { sessionID: "v2-child-after-dispose" })
+        const after = loadState(pid)
+        assert.ok(
+            after.sessions["v2-child-after-dispose"],
+            "idle event after cleanup must not be processed (subscription aborted)",
+        )
+
+        const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/title-update", force: true })
+        assert.ok(cleanup.includes("wt/title-update: removed"), `final cleanup should succeed, got: ${cleanup}`)
+    })
 })
 
 describe("git-common state backend", () => {
@@ -521,7 +720,7 @@ describe("git-common state backend", () => {
     })
 
     test("git-common mode: plugin loads with sidecar stateLocation=git-common", async () => {
-        gcPlugin = await WorktreePlugin({ directory: gcRepoDir, client: mockClientGc })
+        gcPlugin = await pluginEntry.server({ directory: gcRepoDir, client: mockClientGc })
         assert.ok(gcPlugin.tool.worktree_prepare, "worktree_prepare present in git-common mode")
         assert.ok(gcPlugin["tool.execute.before"], "before hook present in git-common mode")
     })
@@ -632,9 +831,9 @@ describe("git-common state backend", () => {
             { action: "apply", branch: "wt/gc-second", force: true },
             makeGcTctx2(),
         )
-        assert.ok(result.includes("wt/gc-second: removed"), `cleanup should remove, got: ${result}`)
-        assert.ok(!existsSync(f2), "session 2 binding file must be removed after cleanup")
-        assert.ok(!existsSync(b2.path), "session 2 worktree directory must be removed")
+        assert.ok(result.includes("wt/gc-second: removed"), `cleanup should succeed, got: ${result}`)
+        assert.ok(!existsSync(f2), "session 2 binding file must be removed by cleanup")
+        assert.ok(!existsSync(b2.path), "session 2 worktree dir must be removed")
         assert.equal(backend.loadBinding(GC_SESSION_2), null, "session 2 must be unbound after cleanup")
     })
 
@@ -706,7 +905,7 @@ describe("strict modes + worktree_allow", () => {
     })
 
     test("strict plugin loads with strictWrites=true + strictGitOps=true and exposes worktree_allow", async () => {
-        strictPlugin = await WorktreePlugin({ directory: strictRepo, client: mockClientS })
+        strictPlugin = await pluginEntry.server({ directory: strictRepo, client: mockClientS })
         assert.ok(strictPlugin.tool.worktree_allow, "worktree_allow must be present")
         assert.ok(strictPlugin["tool.execute.before"], "before hook present")
     })
@@ -1061,7 +1260,7 @@ describe("audit log (T3.2)", () => {
     }
 
     test("audit plugin loads with strict modes and exposes tools", async () => {
-        auditPlugin = await WorktreePlugin({ directory: auditRepo, client: mockClientA })
+        auditPlugin = await pluginEntry.server({ directory: auditRepo, client: mockClientA })
         assert.ok(auditPlugin.tool.worktree_prepare, "worktree_prepare present")
         assert.ok(auditPlugin.tool.worktree_allow, "worktree_allow present")
         assert.ok(auditPlugin["tool.execute.before"], "before hook present")
@@ -1238,7 +1437,7 @@ describe("SessionStart discipline injection (T3.3)", () => {
     })
 
     test("non-strict mode (default config) does not inject discipline prompt", async () => {
-        const plugin = await WorktreePlugin({ directory: defaultRepo, client: mockClientSS })
+        const plugin = await pluginEntry.server({ directory: defaultRepo, client: mockClientSS })
         const system = ["existing system prompt"]
         await plugin["experimental.chat.system.transform"](
             { sessionID: SS_SESSION },
@@ -1249,7 +1448,7 @@ describe("SessionStart discipline injection (T3.3)", () => {
     })
 
     test("strictWrites mode injects discipline prompt when no binding", async () => {
-        const plugin = await WorktreePlugin({ directory: strictRepo, client: mockClientSS })
+        const plugin = await pluginEntry.server({ directory: strictRepo, client: mockClientSS })
         const system = ["existing system prompt"]
         await plugin["experimental.chat.system.transform"](
             { sessionID: SS_SESSION },
@@ -1269,7 +1468,7 @@ describe("SessionStart discipline injection (T3.3)", () => {
     })
 
     test("binding present always injects ACTIVE WORKTREE prompt (Tier 1 behavior preserved)", async () => {
-        const plugin = await WorktreePlugin({ directory: strictRepo, client: mockClientSS })
+        const plugin = await pluginEntry.server({ directory: strictRepo, client: mockClientSS })
         const result = await plugin.tool.worktree_prepare.execute(
             { title: "ss-binding-test" },
             makeSsTctx(strictRepo, SS_SESSION),
@@ -1291,4 +1490,10 @@ describe("SessionStart discipline injection (T3.3)", () => {
             "discipline prompt must NOT be injected when a binding exists",
         )
     })
+})
+
+after(() => {
+    try {
+        rmSync(testRoot, { recursive: true, force: true })
+    } catch {}
 })
