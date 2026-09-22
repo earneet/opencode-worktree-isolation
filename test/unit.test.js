@@ -1512,6 +1512,10 @@ describe("commitWorktreeChanges (issue #10)", () => {
         mkdirSync(repo, { recursive: true })
         assert.ok(git(["init", "-b", "master"], repo).ok, "git init")
         assert.ok(git(["config", "core.autocrlf", "false"], repo).ok)
+        // Repo-local identity: CI runners carry no global git identity, and the
+        // snapshot tests below need real commits.
+        assert.ok(git(["config", "user.email", "t@t"], repo).ok)
+        assert.ok(git(["config", "user.name", "tester"], repo).ok)
         writeFileSync(path.join(repo, "a.txt"), "base\n")
         assert.ok(git(["add", "-A"], repo).ok)
         assert.ok(git([...ID, "commit", "-m", "base"], repo).ok)
@@ -1566,11 +1570,17 @@ describe("commitWorktreeChanges (issue #10)", () => {
         const prevS = process.env.GIT_CONFIG_SYSTEM
         process.env.GIT_CONFIG_GLOBAL = emptyCfg
         process.env.GIT_CONFIG_SYSTEM = emptyCfg
+        // Neutralize the repo-local identity too: the env redirect above only
+        // isolates host-global config, while local config still satisfies git.
+        assert.ok(git(["config", "--unset", "user.email"], repo).ok)
+        assert.ok(git(["config", "--unset", "user.name"], repo).ok)
         try {
             const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
             assert.equal(r.ok, false)
             assert.ok(r.err && /ident|name/i.test(r.err), `err should carry git's message, got: ${r.err}`)
         } finally {
+            assert.ok(git(["config", "user.email", "t@t"], repo).ok)
+            assert.ok(git(["config", "user.name", "tester"], repo).ok)
             if (prevG === undefined) delete process.env.GIT_CONFIG_GLOBAL
             else process.env.GIT_CONFIG_GLOBAL = prevG
             if (prevS === undefined) delete process.env.GIT_CONFIG_SYSTEM
