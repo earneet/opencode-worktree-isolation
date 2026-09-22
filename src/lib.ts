@@ -500,10 +500,12 @@ export interface SnapshotResult {
 // /var/..., git answers /private/var/...) or a Windows 8.3 short name (CI
 // runners expose TEMP as C:\Users\RUNNER~1\...). Compare physical forms, or
 // every healthy worktree under such a root gets misclassified as unreachable
-// and merge deletes unsnapshotted work.
+// and merge deletes unsnapshotted work. The .native realpath is required on
+// Windows: libuv's portable variant resolves link components but leaves 8.3
+// short names in place. Its \\?\-prefixed output is folded away by norm().
 function samePhysicalPath(logicalPath: string, canonicalPath: string): boolean {
     try {
-        return norm(realpathSync(logicalPath)) === norm(canonicalPath)
+        return norm(realpathSync.native(logicalPath)) === norm(realpathSync.native(canonicalPath))
     } catch {
         return false
     }
