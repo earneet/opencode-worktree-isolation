@@ -1588,6 +1588,47 @@ describe("commitWorktreeChanges (issue #10)", () => {
         }
     })
 
+    test("a worktree reached through a symlinked/junction root is not misclassified as unreachable", () => {
+        const root = mkdtempSync(path.join(tmpdir(), "ocwt-symlink-"))
+        try {
+            const repo = path.join(root, "repo")
+            mkdirSync(repo, { recursive: true })
+            assert.ok(git(["init", "-b", "master"], repo).ok)
+            assert.ok(git(["config", "core.autocrlf", "false"], repo).ok)
+            assert.ok(git(["config", "user.email", "t@t"], repo).ok)
+            assert.ok(git(["config", "user.name", "tester"], repo).ok)
+            writeFileSync(path.join(repo, "a.txt"), "base\n")
+            assert.ok(git(["add", "-A"], repo).ok)
+            assert.ok(git([...ID, "commit", "-m", "base"], repo).ok)
+
+            // Reach the worktree through a link to a physical directory: the
+            // stored path is logical while git's toplevel output is physical.
+            // This is the macOS $TMPDIR (/var vs /private/var) and Windows
+            // 8.3-TEMP (RUNNER~1 vs runneradmin) shape that CI exposed.
+            const physicalRoot = path.join(root, "physical")
+            mkdirSync(path.join(physicalRoot, "wt"), { recursive: true })
+            const logicalRoot = path.join(root, "logical")
+            try {
+                symlinkSync(physicalRoot, logicalRoot, process.platform === "win32" ? "junction" : "dir")
+            } catch {
+                return
+            }
+            const wt = path.join(logicalRoot, "wt")
+            assert.ok(git(["worktree", "add", wt, "-b", "wt/link-root"], repo).ok, "worktree add via link")
+
+            writeFileSync(path.join(wt, "wip.txt"), "work\n")
+            const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
+            assert.equal(
+                r.ok,
+                true,
+                `a logical path to the same physical worktree must not be unreachable, got: ${JSON.stringify(r)}`,
+            )
+            assert.equal(r.committed, true, "the dirty work must be snapshotted, not discarded")
+        } finally {
+            try { rmSync(root, { recursive: true, force: true }) } catch {}
+        }
+    })
+
     test("a broken worktree (lost .git file) is unreachable, distinct from a commit failure", () => {
         const broken = path.join(root, "wt-broken")
         assert.ok(git(["worktree", "add", broken, "-b", "wt/broken-snap"], repo).ok, "worktree add")

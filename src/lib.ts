@@ -15,6 +15,7 @@ import {
     appendFileSync,
     rmSync,
     mkdtempSync,
+    realpathSync,
 } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import * as path from "node:path"
@@ -494,6 +495,20 @@ export interface SnapshotResult {
 // an unconditional --allow-empty snapshot moved the branch tip past the merge
 // base whenever a later removal failed, flipping the branch from "merged" to
 // "unmerged" between two cleanup calls (issue #10).
+// git's toplevel output is a canonical (physical) path; the worktree path we
+// hold may be a logical form — behind a symlink or junction (macOS $TMPDIR is
+// /var/..., git answers /private/var/...) or a Windows 8.3 short name (CI
+// runners expose TEMP as C:\Users\RUNNER~1\...). Compare physical forms, or
+// every healthy worktree under such a root gets misclassified as unreachable
+// and merge deletes unsnapshotted work.
+function samePhysicalPath(logicalPath: string, canonicalPath: string): boolean {
+    try {
+        return norm(realpathSync(logicalPath)) === norm(canonicalPath)
+    } catch {
+        return false
+    }
+}
+
 export function commitWorktreeChanges(worktreePath: string, message: string): SnapshotResult {
     // Guard against two look-alike failures before trusting any git output
     // (issue #10 r2): a worktree whose .git file was lost may still resolve
@@ -503,7 +518,7 @@ export function commitWorktreeChanges(worktreePath: string, message: string): Sn
     // pending work is preservable. `git rev-parse --show-toplevel` returns
     // exactly the worktree path only for a functioning worktree repository.
     const top = git(["rev-parse", "--show-toplevel"], worktreePath)
-    if (!top.ok || norm(top.stdout.trim()) !== norm(worktreePath)) {
+    if (!top.ok || !samePhysicalPath(worktreePath, top.stdout.trim())) {
         return {
             committed: false,
             ok: false,
