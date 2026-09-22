@@ -1564,12 +1564,14 @@ describe("commitWorktreeChanges (issue #10)", () => {
 
     test("commit failure (no identity) is reported as not-ok so callers can keep the worktree", () => {
         writeFileSync(path.join(wt, "c.txt"), "uncommitted\n")
-        const emptyCfg = path.join(root, "empty.gitconfig")
-        writeFileSync(emptyCfg, "")
+        // useConfigOnly forbids git's host-dependent identity auto-guessing so
+        // the missing identity fails deterministically on every platform.
+        const noidCfg = path.join(root, "noid.gitconfig")
+        writeFileSync(noidCfg, "[user]\n\tuseConfigOnly = true\n")
         const prevG = process.env.GIT_CONFIG_GLOBAL
         const prevS = process.env.GIT_CONFIG_SYSTEM
-        process.env.GIT_CONFIG_GLOBAL = emptyCfg
-        process.env.GIT_CONFIG_SYSTEM = emptyCfg
+        process.env.GIT_CONFIG_GLOBAL = noidCfg
+        process.env.GIT_CONFIG_SYSTEM = noidCfg
         // Neutralize the repo-local identity too: the env redirect above only
         // isolates host-global config, while local config still satisfies git.
         assert.ok(git(["config", "--unset", "user.email"], repo).ok)

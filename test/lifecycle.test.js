@@ -815,9 +815,13 @@ describe("merge and cleanup without commit identity (issue #10)", () => {
     before(async () => {
         prevGlobal = process.env.GIT_CONFIG_GLOBAL
         prevSystem = process.env.GIT_CONFIG_SYSTEM
-        process.env.GIT_CONFIG_GLOBAL = path.join(testRoot, "empty.gitconfig")
-        process.env.GIT_CONFIG_SYSTEM = path.join(testRoot, "empty.gitconfig")
-        writeFileSync(path.join(testRoot, "empty.gitconfig"), "")
+        process.env.GIT_CONFIG_GLOBAL = path.join(testRoot, "noid.gitconfig")
+        process.env.GIT_CONFIG_SYSTEM = path.join(testRoot, "noid.gitconfig")
+        // useConfigOnly forbids git's host-dependent identity auto-guessing:
+        // on some hosts (CI macOS runners) git happily commits as
+        // runner@Mac-....local with only a warning, which would silently
+        // invalidate the "no identity" premise of these tests.
+        writeFileSync(path.join(testRoot, "noid.gitconfig"), "[user]\n\tuseConfigOnly = true\n")
 
         mkdirSync(repoDir, { recursive: true })
         assert.ok(git(["init", "-b", "master"], repoDir).ok, "git init")
