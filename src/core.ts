@@ -15,6 +15,7 @@ import {
     applyInterception,
     isDotGitPath,
     removeWorktreeDir,
+    commitWorktreeChanges,
     isAllowlisted,
     existsSync,
     mkdirSync,
@@ -25,7 +26,7 @@ import {
     findSessionsForWorktree,
     mergedBranchSet,
 } from "./lib.js"
-import type { DecisionContext, MutableToolArgs, SessionBinding, WorktreeState } from "./lib.js"
+import type { DecisionContext, MutableToolArgs, SessionBinding, SnapshotResult, WorktreeState } from "./lib.js"
 
 export const DESCRIPTIONS = {
     prepare:
@@ -36,7 +37,8 @@ export const DESCRIPTIONS = {
     cleanup:
         "Preview or apply cleanup of worktrees created by worktree_prepare. " +
         "preview: list managed worktrees with merge/dirty status. " +
-        "apply: remove a specific branch's worktree (or all merged ones), delete the branch, and unbind.",
+        "apply: remove a specific branch's worktree (or all merged ones), delete the branch, and unbind. " +
+        "force=true also removes unmerged worktrees and discards uncommitted changes that cannot be snapshotted.",
     merge:
         "Merge a worktree's branch back into the main checkout, then clean up. " +
         "preview: show the merge plan (target branch, commits, diff stat, uncommitted changes) without merging. " +
@@ -58,7 +60,7 @@ export const ARG_DESCRIPTIONS = {
     cleanup: {
         action: "preview = list only; apply = remove",
         branch: "For apply: limit to this branch; omit to process all merged worktrees",
-        force: "For apply: remove even if the branch is not merged into the base",
+        force: "For apply: remove even if the branch is not merged into the base, or if uncommitted changes cannot be snapshotted (they are discarded)",
     },
     merge: {
         action: "preview = show merge plan only; apply = merge + cleanup + unbind",
@@ -361,7 +363,8 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             }
             const lines = [...byPath.values()].map(({ binding: b, sessions }) => {
                 const merged = mergedSet ? mergedSet.has(b.branch) : null
-                const dirty = git(["status", "--porcelain"], b.path).stdout.trim() ? "dirty" : "clean"
+                const dirtyRes = git(["status", "--porcelain"], b.path)
+                const dirty = !dirtyRes.ok ? "unknown" : dirtyRes.stdout.trim() ? "dirty" : "clean"
                 const present = existsSync(b.path) ? "present" : "missing"
                 const flag = cfg.protectedBranches.includes(b.branch) ? " 🔒protected" : ""
                 return `  ${b.branch.padEnd(28)} ${(merged === true ? "merged" : merged === false ? "unmerged" : "unknown").padEnd(10)} ${dirty.padEnd(7)} ${present}  sessions=${sessions}${flag}  "${b.title || ""}"`
@@ -420,9 +423,28 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             }
             runHookCommands(cfg.hooks.preDelete || [], repBinding.path)
             removeSyncedLinks(repBinding.path, cfg.sync.symlinkDirs || [])
+            // Snapshot only when something actually changed: an empty
+            // --allow-empty commit here moved the branch tip past the base
+            // whenever removal then failed, making the next apply report
+            // "unmerged" and contradicting the previous preview (issue #10).
+            // force=true expresses consent to discard unmerged work, so it
+            // also bypasses a failed snapshot (with a loud note).
+            let snap: SnapshotResult = { committed: false, ok: true }
             if (existsSync(repBinding.path)) {
-                git(["add", "-A"], repBinding.path)
-                git(["commit", "-m", "chore(worktree): pre-cleanup snapshot", "--allow-empty"], repBinding.path)
+                snap = commitWorktreeChanges(repBinding.path, "chore(worktree): pre-cleanup snapshot")
+                if (!snap.ok && !args.force) {
+                    skipped.push(
+                        `  ⚠ ${repBinding.branch}: snapshot failed, worktree left in place (use force=true to discard) - ${snap.err}`,
+                    )
+                    stateBackend.appendAudit({
+                        type: "cleanup_skip",
+                        sessionId: repSid,
+                        branch: repBinding.branch,
+                        reason: "snapshot-failed",
+                        err: (snap.err || "").split("\n")[0],
+                    })
+                    continue
+                }
                 const rm = git(["worktree", "remove", "--force", repBinding.path], R)
                 if (!rm.ok) {
                     const fb = removeWorktreeDir(repBinding.path)
@@ -446,10 +468,14 @@ export function createCore(opts: CoreOptions): WorktreeCore {
                 sessionId: repSid,
                 branch: repBinding.branch,
                 reason: args.force ? "force" : "merged",
+                ...(!snap.ok ? { snapshotDiscarded: (snap.err || "").split("\n")[0] } : {}),
             })
             removed.push(
                 `  ✅ ${repBinding.branch}: removed` +
-                    (released.length ? ` (released ${released.length} inherited binding(s))` : ""),
+                    (released.length ? ` (released ${released.length} inherited binding(s))` : "") +
+                    (!snap.ok
+                        ? ` ⚠ snapshot failed, uncommitted work discarded: ${(snap.err || "").split("\n")[0]}`
+                        : ""),
             )
         }
         return (
@@ -495,11 +521,24 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         const dirtyCount = dirtyFiles.length
 
         if (args.action === "preview") {
+            const commitsText = !logRes.ok
+                ? `     ⚠ git log failed: ${(logRes.stderr || logRes.stdout).trim()}`
+                : commits
+                  ? commits.split("\n").map((l) => "     " + l).join("\n")
+                  : "     (none — already up to date)"
+            const diffText = !diffRes.ok
+                ? `     ⚠ git diff failed: ${(diffRes.stderr || diffRes.stdout).trim()}`
+                : diffStat
+                  ? diffStat.split("\n").map((l) => "     " + l).join("\n")
+                  : "     (no file changes)"
             return (
                 `Merge preview: "${branch}" → "${target}"\n` +
                 `   worktree: ${W}\n` +
-                `   commits to merge:\n${commits ? commits.split("\n").map((l) => "     " + l).join("\n") : "     (none — already up to date)"}\n` +
-                `   diff stat:\n${diffStat ? diffStat.split("\n").map((l) => "     " + l).join("\n") : "     (no file changes)"}\n` +
+                (dirtyRes.ok
+                    ? ""
+                    : `   ⚠ could not inspect the worktree at ${W}: ${(dirtyRes.stderr || dirtyRes.stdout).trim()}\n`) +
+                `   commits to merge:\n${commitsText}\n` +
+                `   diff stat:\n${diffText}\n` +
                 (dirtyCount
                     ? `   ⚠ ${dirtyCount} uncommitted change(s) will be auto-committed before merge:\n` +
                       dirtyFiles.slice(0, 20).map((l) => `     ${l}`).join("\n") +
@@ -545,18 +584,40 @@ export function createCore(opts: CoreOptions): WorktreeCore {
                 )
             }
         }
-        if (dirtyCount) {
-            git(["add", "-A"], W)
-            const c = git(["commit", "-m", "chore(worktree): pre-merge snapshot", "--allow-empty"], W)
-            if (!c.ok) return `❌ Failed to commit worktree changes before merge: ${c.stderr.trim()}`
+        // A missing worktree dir means there is nothing left to snapshot; the
+        // branch may still carry work worth merging, so snapshot only when the
+        // directory exists.
+        const snap: SnapshotResult = existsSync(W)
+            ? commitWorktreeChanges(W, "chore(worktree): pre-merge snapshot")
+            : { committed: false, ok: true }
+        // An unreachable worktree (git cannot even run there, e.g. a leftover
+        // shell after a partial external deletion) has nothing preservable via
+        // git — self-heal with a loud warning instead of blocking the merge.
+        // A reachable one whose commit failed (e.g. missing identity) keeps
+        // blocking: the user can fix git config and retry without loss.
+        if (!snap.ok && !snap.unreachable) {
+            return `❌ Failed to commit worktree changes before merge: ${snap.err}`
         }
-        const mergeRes = git(["merge", "--no-ff", "-m", `Merge worktree '${branch}'`, branch], R)
+        const snapWarning = !snap.ok
+            ? `   ⚠ worktree at ${W} could not be inspected (${(snap.err || "").split("\n")[0]}); it was removed without a snapshot\n`
+            : ""
+        // A plain merge fast-forwards when possible: forcing --no-ff made even
+        // pure-ff merges create a commit, requiring committer identity/signing
+        // and failing in environments where `git merge --ff-only` succeeds
+        // (issue #10). Diverged branches still get a merge commit with the
+        // message below.
+        const mergeRes = git(["merge", "-m", `Merge worktree '${branch}'`, branch], R)
         if (!mergeRes.ok) {
             git(["merge", "--abort"], R)
+            // git spreads merge diagnostics across both streams (conflict
+            // details on stdout, the failure verdict on stderr); concat them
+            // so the real cause is never hidden behind "||".
+            const mergeOutput = [mergeRes.stdout.trim(), mergeRes.stderr.trim()].filter(Boolean).join("\n")
             return (
-                `❌ Merge of "${branch}" into "${target}" failed (likely conflicts). The merge was aborted; the repo is left clean.\n` +
-                `${(mergeRes.stderr || mergeRes.stdout).trim()}\n` +
-                `Resolve conflicts manually (or rebase "${branch}" onto "${target}") and retry.`
+                `❌ Merge of "${branch}" into "${target}" failed; the merge was aborted and the repo is left clean.\n` +
+                `git output:\n${mergeOutput}\n` +
+                `If git reported conflicts, resolve them (or rebase "${branch}" onto "${target}") and retry; ` +
+                `if it reported identity/signing problems, fix your git configuration and retry.`
             )
         }
         if (existsSync(W)) {
@@ -565,13 +626,19 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             if (!rm.ok) {
                 const fb = removeWorktreeDir(W)
                 if (!fb.ok) {
+                    // Do NOT suggest raw `robocopy /MIR` here: its PURGE follows
+                    // junctions on the target side and can delete files at the
+                    // link target (the very hazard stripReparsePoints exists
+                    // for). The cleanup tool routes through that safe path.
                     return (
                         `⚠ Merged "${branch}" into "${target}", but worktree removal failed: ${rm.stderr.trim()}\n` +
                         `⚠ Fallback deletion (${fb.method}) also failed: ${fb.err ?? "unknown error"}\n` +
+                        (snap.ok
+                            ? ""
+                            : `⚠ Snapshot: failed — ${(snap.err || "").split("\n")[0]}\n`) +
                         `This session is STILL BOUND to ${W} — read/write/edit keep targeting it. ` +
-                        `The binding expires automatically once the directory is deleted, e.g.:\n` +
-                        `   robocopy <empty-dir> ${W} /MIR\n` +
-                        `   rmdir /s /q <empty-dir>\n` +
+                        `The binding expires automatically once the directory is deleted. Remove safely via:\n` +
+                        `   worktree_cleanup(action="apply", branch="${branch}", force=true)\n` +
                         `   git worktree prune`
                     )
                 }
@@ -591,11 +658,13 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             sessionId: boundSid ?? call.sessionId,
             branch,
             target,
+            ...(!snap.ok ? { snapshotSkipped: (snap.err || "").split("\n")[0] } : {}),
         })
         return (
             `✅ Merged "${branch}" into "${target}" and cleaned up.\n` +
             `   worktree removed: ${W}\n` +
             `   branch deleted:   ${branch}\n` +
+            (snapWarning ? snapWarning : "") +
             (inheritedReleased
                 ? `   inherited bindings released: ${inheritedReleased}\n`
                 : "") +

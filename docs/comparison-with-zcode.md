@@ -400,7 +400,7 @@ export function resolveBinding(common, sessionId) {
 
 ```
 worktree_merge(action="preview")   →  展示合并计划（目标分支、提交、diff、未提交变更数）
-worktree_merge(action="apply")     →  自动提交未提交变更 → git merge --no-ff → 删 worktree → 删分支 → 解绑
+worktree_merge(action="apply")     →  自动提交未提交变更 → git merge（ff 优先）→ 删 worktree → 删分支 → 解绑
 ```
 
 **优点**：

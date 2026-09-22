@@ -18,6 +18,8 @@ import {
     escapeRegex,
     atomicWriteFileSync,
     findSessionsForWorktree,
+    git,
+    commitWorktreeChanges,
     parseMergedBranches,
     decidePathAction,
     decideSearchPathAction,
@@ -60,6 +62,19 @@ test("norm: lowercases and converts backslashes to forward slashes (Windows)", (
     if (process.platform !== "win32") return
     assert.equal(norm("C:/Test/Repo"), "c:/test/repo")
     assert.equal(norm("C:\\Test\\Repo"), "c:/test/repo")
+})
+
+test("norm: strips Windows extended-length prefixes so they match plain forms", () => {
+    assert.equal(norm("\\\\?\\" + REPO.replace(/\//g, "\\")), norm(REPO))
+    assert.equal(norm("\\\\?\\" + REPO_FWD), norm(REPO))
+})
+
+test("norm: UNC extended-length form maps to a UNC path (Windows)", () => {
+    // POSIX path.resolve folds the leading "//" of a UNC form, so the exact
+    // string assertion is Windows-only; the portable guarantee (prefix forms
+    // equal their plain forms) is covered by the test above.
+    if (process.platform !== "win32") return
+    assert.equal(norm("\\\\?\\UNC\\Server\\Share\\file.txt"), "//server/share/file.txt")
 })
 
 test("norm: native path normalizes to forward-slash lowercase form", () => {
@@ -1288,6 +1303,350 @@ describe("removeSyncedLinks", () => {
             assert.ok(existsSync(path.join(dir, "node_modules", "pkg.json")), "regular directory must not be deleted")
         } finally {
             try { rmSync(dir, { recursive: true, force: true }) } catch {}
+        }
+    })
+})
+
+describe("relative path routing (issue #10)", () => {
+    const REL_CTX = { isWrite: true, toolName: "edit", repoRoot: REPO, worktreePath: WT }
+
+    test("decidePathAction rewrites a repo-relative path into the worktree", () => {
+        const r = decidePathAction("packages/writer/test/foo.test.ts", REL_CTX)
+        assert.equal(r.action, "rewrite")
+        assert.equal(r.newTarget, path.join(WT, "packages", "writer", "test", "foo.test.ts"))
+    })
+
+    test("decidePathAction anchors relative paths at repoRoot, not process.cwd()", () => {
+        // The test process cwd is the plugin repo, far away from REPO; if the
+        // implementation resolved against process.cwd() (opencode daemons run
+        // with an unrelated cwd) this would come back as an un-rewritten allow.
+        const r = decidePathAction("src/foo.ts", REL_CTX)
+        assert.equal(r.action, "rewrite")
+    })
+
+    test("decidePathAction lets a relative path that escapes the repo pass through", () => {
+        const r = decidePathAction("../../outside/foo.txt", REL_CTX)
+        assert.equal(r.action, "allow")
+        assert.equal(r.source, "outside-repo")
+    })
+
+    test("decidePathAction denies a relative main-checkout write in strictWrites mode (no binding)", () => {
+        const r = decidePathAction("src/foo.ts", { ...REL_CTX, worktreePath: null, strictWrites: true })
+        assert.equal(r.action, "deny")
+        assert.match(r.reason, /strictWrites/)
+    })
+
+    test("applyInterception rewrites a relative filePath (edit)", () => {
+        const args = { filePath: "src/foo.ts" }
+        applyInterception("edit", args, REL_CTX)
+        assert.equal(args.filePath, path.join(WT, "src", "foo.ts"))
+    })
+
+    test("applyInterception rewrites a relative path field (write)", () => {
+        const args = { path: "docs/design.md" }
+        applyInterception("write", args, { ...REL_CTX, toolName: "write" })
+        assert.equal(args.path, path.join(WT, "docs", "design.md"))
+    })
+
+    test("applyInterception rewrites a relative read path", () => {
+        const args = { path: "README.md" }
+        applyInterception("read", args, { ...REL_CTX, toolName: "read", isWrite: false })
+        assert.equal(args.path, path.join(WT, "README.md"))
+    })
+
+    test("decideSearchPathAction rewrites a relative search path into the worktree", () => {
+        const r = decideSearchPathAction("packages/writer", REPO, WT)
+        assert.equal(r.action, "rewrite")
+        assert.equal(r.newPath, path.join(WT, "packages", "writer"))
+    })
+
+    test("applyInterception rewrites a relative grep path", () => {
+        const args = { pattern: "foo", path: "packages" }
+        applyInterception("grep", args, REL_CTX)
+        assert.equal(args.path, path.join(WT, "packages"))
+    })
+
+    test("decidePathAction denies a relative .git path (anchored before the .git check)", () => {
+        const r = decidePathAction(".git/config", REL_CTX)
+        assert.equal(r.action, "deny")
+    })
+
+    test("applyInterception throws on a relative .git read path", () => {
+        assert.throws(
+            () => applyInterception("read", { path: ".git/config" }, { ...REL_CTX, toolName: "read", isWrite: false }),
+            /\.git/,
+        )
+    })
+
+    test("relative path matching an allowlist entry is allowed in strictWrites mode (no binding)", () => {
+        const agPath = path.join(REPO, "AGENTS.md")
+        const r = decidePathAction("AGENTS.md", {
+            ...REL_CTX,
+            worktreePath: null,
+            strictWrites: true,
+            allowlistMatcher: (p) => p === agPath,
+        })
+        assert.equal(r.action, "allow")
+        assert.equal(r.source, "allowlist")
+    })
+
+    test("relative path matching a whitelist pattern is allowed in strictWrites mode (no binding)", () => {
+        const r = decidePathAction("AGENTS.md", {
+            ...REL_CTX,
+            worktreePath: null,
+            strictWrites: true,
+            whitelist: ["AGENTS.md"],
+        })
+        assert.equal(r.action, "allow")
+        assert.equal(r.source, "whitelist")
+    })
+
+    test("relative path outside the allowlist is still denied in strictWrites mode", () => {
+        const r = decidePathAction("src/foo.ts", {
+            ...REL_CTX,
+            worktreePath: null,
+            strictWrites: true,
+            allowlistMatcher: () => false,
+        })
+        assert.equal(r.action, "deny")
+    })
+
+    test("decideSearchPathAction lets a relative search path that escapes the repo pass through", () => {
+        const r = decideSearchPathAction("../../outside", REPO, WT)
+        assert.equal(r.action, "allow")
+    })
+
+    test("an extended-length (\\\\?\\) prefixed repo path is still rewritten into the worktree", () => {
+        if (process.platform !== "win32") return
+        const prefixed = "\\\\?\\" + path.join(REPO, "src", "foo.ts")
+        const r = decidePathAction(prefixed, REL_CTX)
+        assert.equal(r.action, "rewrite", `prefixed form must match its plain form, got: ${JSON.stringify(r)}`)
+        assert.equal(r.newTarget, path.join(WT, "src", "foo.ts"))
+    })
+
+    test("an extended-length prefixed .git path is still denied", () => {
+        const prefixed = "\\\\" + "?\\" + path.join(REPO, ".git", "config")
+        const r = decidePathAction(prefixed, REL_CTX)
+        assert.equal(r.action, "deny")
+    })
+})
+
+describe("removeWorktreeDir reparse-point safety (issue #10)", () => {
+    test("junction inside the worktree is not followed; the link target survives", () => {
+        if (process.platform !== "win32") return
+        const root = mkdtempSync(path.join(tmpdir(), "rmwt-jx-"))
+        try {
+            const victim = path.join(root, "victim-node-modules")
+            const target = path.join(root, "worktree")
+            mkdirSync(path.join(victim, "pkg"), { recursive: true })
+            writeFileSync(path.join(victim, "pkg", "real.txt"), "precious")
+            mkdirSync(path.join(target, "src"), { recursive: true })
+            writeFileSync(path.join(target, "src", "app.ts"), "x")
+            symlinkSync(victim, path.join(target, "node_modules"), "junction")
+
+            const r = removeWorktreeDir(target)
+
+            assert.equal(r.ok, true, `removal should succeed: ${JSON.stringify(r)}`)
+            assert.ok(!existsSync(target), "worktree shell must be gone")
+            assert.ok(existsSync(path.join(victim, "pkg", "real.txt")), "junction target must NOT be deleted")
+            assert.equal(readFileSync(path.join(victim, "pkg", "real.txt"), "utf8"), "precious")
+        } finally {
+            try { rmSync(root, { recursive: true, force: true }) } catch {}
+        }
+    })
+
+    test("a removal ROOT that is itself a link is unlinked, never followed", () => {
+        const root = mkdtempSync(path.join(tmpdir(), "rmwt-rootlink-"))
+        try {
+            const victim = path.join(root, "victim")
+            const target = path.join(root, "worktree-link")
+            mkdirSync(path.join(victim, "pkg"), { recursive: true })
+            writeFileSync(path.join(victim, "pkg", "real.txt"), "precious")
+            try {
+                symlinkSync(victim, target, process.platform === "win32" ? "junction" : "dir")
+            } catch (e) {
+                if (process.platform === "win32") {
+                    try { symlinkSync(victim, target, "dir") } catch { return }
+                } else {
+                    return
+                }
+            }
+
+            const r = removeWorktreeDir(target)
+
+            assert.ok(!existsSync(target), "the root link itself must be removed")
+            assert.ok(
+                existsSync(path.join(victim, "pkg", "real.txt")),
+                "a root-level link target must NOT be purged",
+            )
+            if (process.platform === "win32") {
+                assert.equal(r.ok, true, `unlink-only removal should succeed: ${JSON.stringify(r)}`)
+            }
+        } finally {
+            try { rmSync(root, { recursive: true, force: true }) } catch {}
+        }
+    })
+
+    test("nested regular content is still fully removed", () => {
+        const root = mkdtempSync(path.join(tmpdir(), "rmwt-nested-"))
+        try {
+            const target = path.join(root, "wt")
+            mkdirSync(path.join(target, "a", "b", "c"), { recursive: true })
+            writeFileSync(path.join(target, "a", "b", "c", "leaf.txt"), "x")
+            const r = removeWorktreeDir(target)
+            assert.equal(r.ok, true)
+            assert.ok(!existsSync(target))
+        } finally {
+            try { rmSync(root, { recursive: true, force: true }) } catch {}
+        }
+    })
+})
+
+describe("commitWorktreeChanges (issue #10)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "ocwt-snap-"))
+    const repo = path.join(root, "repo")
+    const wt = path.join(root, "wt")
+    const ID = ["-c", "user.name=tester", "-c", "user.email=t@t"]
+
+    before(() => {
+        mkdirSync(repo, { recursive: true })
+        assert.ok(git(["init", "-b", "master"], repo).ok, "git init")
+        assert.ok(git(["config", "core.autocrlf", "false"], repo).ok)
+        writeFileSync(path.join(repo, "a.txt"), "base\n")
+        assert.ok(git(["add", "-A"], repo).ok)
+        assert.ok(git([...ID, "commit", "-m", "base"], repo).ok)
+        assert.ok(git(["worktree", "add", wt, "-b", "wt/snap"], repo).ok, "git worktree add")
+    })
+
+    after(() => {
+        try { rmSync(root, { recursive: true, force: true }) } catch {}
+    })
+
+    test("clean worktree: no commit is created and the branch tip is untouched", () => {
+        const before = git(["rev-parse", "HEAD"], wt).stdout.trim()
+        const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
+        assert.deepEqual(r, { committed: false, ok: true })
+        const after = git(["rev-parse", "HEAD"], wt).stdout.trim()
+        assert.equal(before, after, "an unconditional --allow-empty snapshot must not move the tip")
+    })
+
+    test("ghost-dirty tree (staged change reverted in the worktree) is not a failure", () => {
+        // Stage a modification, then restore the worktree content to HEAD:
+        // porcelain shows MM, but `add -A` collapses the index back onto HEAD,
+        // leaving `git commit` with nothing to commit. That is a clean tree,
+        // not a snapshot failure (issue #10 review finding).
+        writeFileSync(path.join(wt, "a.txt"), "modified\n")
+        assert.ok(git(["add", "a.txt"], wt).ok)
+        writeFileSync(path.join(wt, "a.txt"), "base\n")
+        const before = git(["rev-parse", "HEAD"], wt).stdout.trim()
+
+        const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
+
+        assert.equal(r.ok, true, `ghost-dirty must be treated as clean, got: ${JSON.stringify(r)}`)
+        assert.equal(git(["rev-parse", "HEAD"], wt).stdout.trim(), before, "tip must not move")
+    })
+
+    test("dirty worktree: pending changes are committed onto the branch", () => {
+        writeFileSync(path.join(wt, "b.txt"), "new work\n")
+        const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
+        assert.equal(r.committed, true)
+        assert.equal(r.ok, true)
+        assert.equal(git(["status", "--porcelain"], wt).stdout.trim(), "", "tree must be clean after snapshot")
+        assert.ok(
+            git(["show", "--stat", "--oneline", "HEAD"], wt).stdout.includes("b.txt"),
+            "the snapshot commit must contain the pending change",
+        )
+    })
+
+    test("commit failure (no identity) is reported as not-ok so callers can keep the worktree", () => {
+        writeFileSync(path.join(wt, "c.txt"), "uncommitted\n")
+        const emptyCfg = path.join(root, "empty.gitconfig")
+        writeFileSync(emptyCfg, "")
+        const prevG = process.env.GIT_CONFIG_GLOBAL
+        const prevS = process.env.GIT_CONFIG_SYSTEM
+        process.env.GIT_CONFIG_GLOBAL = emptyCfg
+        process.env.GIT_CONFIG_SYSTEM = emptyCfg
+        try {
+            const r = commitWorktreeChanges(wt, "chore(worktree): snapshot")
+            assert.equal(r.ok, false)
+            assert.ok(r.err && /ident|name/i.test(r.err), `err should carry git's message, got: ${r.err}`)
+        } finally {
+            if (prevG === undefined) delete process.env.GIT_CONFIG_GLOBAL
+            else process.env.GIT_CONFIG_GLOBAL = prevG
+            if (prevS === undefined) delete process.env.GIT_CONFIG_SYSTEM
+            else process.env.GIT_CONFIG_SYSTEM = prevS
+        }
+    })
+
+    test("a broken worktree (lost .git file) is unreachable, distinct from a commit failure", () => {
+        const broken = path.join(root, "wt-broken")
+        assert.ok(git(["worktree", "add", broken, "-b", "wt/broken-snap"], repo).ok, "worktree add")
+        try {
+            unlinkSync(path.join(broken, ".git"))
+            writeFileSync(path.join(broken, "leftover.txt"), "plain\n")
+            const r = commitWorktreeChanges(broken, "chore(worktree): snapshot")
+            assert.equal(r.ok, false)
+            assert.equal(r.unreachable, true, "git cannot even inspect the tree; callers must be told")
+            assert.ok(r.err && /not a git repository/i.test(r.err), `err should carry git's message, got: ${r.err}`)
+        } finally {
+            try { rmSync(broken, { recursive: true, force: true }) } catch {}
+            git(["worktree", "prune"], repo)
+            git(["branch", "-D", "wt/broken-snap"], repo)
+        }
+    })
+
+    test("a corrupt index is a reachable failure: preservable work must not be marked unreachable", () => {
+        const wt2 = path.join(root, "wt-index")
+        assert.ok(git(["worktree", "add", wt2, "-b", "wt/index-snap"], repo).ok, "worktree add")
+        try {
+            writeFileSync(path.join(wt2, "wip.txt"), "preservable work\n")
+            const gitDir = git(["rev-parse", "--absolute-git-dir"], wt2).stdout.trim()
+            writeFileSync(path.join(gitDir, "index"), "garbage")
+            const r = commitWorktreeChanges(wt2, "chore(worktree): snapshot")
+            assert.equal(r.ok, false)
+            assert.notEqual(r.unreachable, true, "the repo is reachable and repairable; blocking must stay possible")
+            assert.ok(r.err && /index/i.test(r.err), `err should carry git's message, got: ${r.err}`)
+        } finally {
+            const gitDir = git(["rev-parse", "--absolute-git-dir"], wt2).ok
+                ? git(["rev-parse", "--absolute-git-dir"], wt2).stdout.trim()
+                : null
+            if (gitDir) unlinkSync(path.join(gitDir, "index"))
+            git(["worktree", "remove", "--force", wt2], repo)
+            git(["worktree", "prune"], repo)
+            git(["branch", "-D", "wt/index-snap"], repo)
+        }
+    })
+
+    test("a broken shell nested inside an outer repo is unreachable without committing to the outer repo", () => {
+        const outer = path.join(root, "outer-repo")
+        mkdirSync(outer, { recursive: true })
+        assert.ok(git(["init", "-b", "master"], outer).ok)
+        assert.ok(git(["config", "core.autocrlf", "false"], outer).ok)
+        writeFileSync(path.join(outer, "base.txt"), "outer base\n")
+        assert.ok(git(["add", "-A"], outer).ok)
+        assert.ok(git([...ID, "commit", "-m", "outer base"], outer).ok)
+        const outerCountBefore = git(["rev-list", "--count", "HEAD"], outer).stdout.trim()
+
+        const shell = path.join(outer, ".worktrees", "shell")
+        assert.ok(git(["worktree", "add", shell, "-b", "wt/outer-shell"], outer).ok, "worktree add inside outer repo")
+        try {
+            unlinkSync(path.join(shell, ".git"))
+            writeFileSync(path.join(shell, "leftover.txt"), "plain\n")
+            // Without the toplevel guard, `git status` walks UP into the outer
+            // repo, succeeds, and the snapshot would commit the leftover files
+            // into the outer repo's history.
+            const r = commitWorktreeChanges(shell, "chore(worktree): snapshot")
+            assert.equal(r.ok, false)
+            assert.equal(r.unreachable, true, "a walk-up into an outer repo must be classified unreachable")
+            assert.equal(
+                git(["rev-list", "--count", "HEAD"], outer).stdout.trim(),
+                outerCountBefore,
+                "the outer repo must not receive the snapshot commit",
+            )
+        } finally {
+            try { rmSync(shell, { recursive: true, force: true }) } catch {}
+            git(["worktree", "prune"], outer)
+            git(["branch", "-D", "wt/outer-shell"], outer)
         }
     })
 })

@@ -122,11 +122,12 @@ worktree_cleanup(action, branch?)
 ### worktree_cleanup
 - **args**：`action: "preview" | "apply"`、`branch?: string`（apply 时指定；省略则处理所有已合并）
 - **preview**：遍历 state.sessions，对每条记录查 `git worktree list`、`git branch --merged <base>`、`git status --porcelain`，输出表格
-- **apply**：对每条匹配（已合并且非 protected）：
-  1. preDelete hooks
-  2. `git worktree remove --force <path>`
-  3. `git branch -d <branch>`（仅已合并；force 时用 `-D`）
-  4. 从 state 移除记录
+- **apply**：对每条匹配（已合并或 force，且非 protected）：
+  1. preDelete hooks、移除 symlinkDirs 同步链接
+  2. 快照：仅当工作区确有未提交变更时 `git add -A` + 提交（无条件 `--allow-empty` 空提交曾把分支尖端移出 merge-base，导致 preview "merged" 与下一次 apply "unmerged" 矛盾，issue #10）；快照失败时无 force → 保留 worktree 跳过，force → 同意丢弃、继续删除并注记
+  3. `git worktree remove --force <path>`；失败则 fallback（Windows 先剥离 reparse points——剥离失败或删除根本身是链接时完全跳过 robocopy、仅 rmSync——再 robocopy /MIR 镜像空目录，`stdio:"ignore"` 防 ENOBUFS，最后 rmSync；robocopy 失败仍尝试 rmSync）
+  4. `git branch -D <branch>`
+  5. 从 state 移除记录
 - **protectedBranches**（配置）永不删除
 
 ## 7. 拦截规则（核心）
@@ -242,13 +243,13 @@ F:\workspace_2\oc-plugin\
 **设计要点**：
 - **合并目标** = 主检出 R 当前所在分支（"合并到你所在的地方"），preview 明确展示
 - **preview/apply 两段式**：符合"用户授意"——preview 给出合并计划（目标分支、待合并提交、diff stat、未提交变更数），确认后再 apply
-- **未提交变更自动快照**：worktree 里的未提交变更在合并前自动 `chore(worktree): pre-merge snapshot` 提交，不丢工作
+- **未提交变更自动快照**：worktree 里的未提交变更在合并前自动 `chore(worktree): pre-merge snapshot` 提交，不丢工作；仅在确有变更时提交（无条件 `--allow-empty` 空提交曾污染 merged 判定，issue #10）。快照失败时：git 可达（如身份缺失，可修复重试）→ 阻塞保留 worktree；git 不可达（`.git` 丢失/回穿外层仓库，无可保全的工作）→ 带警告继续自愈（issue #10 r2）
 - **主检出保护**：主检出有未提交的**已跟踪**变更时拒绝合并（untracked 文件不阻断，因为 merge 不碰它们）
-- **冲突安全回滚**：`git merge --no-ff` 失败则 `git merge --abort`，仓库保持干净
+- **冲突安全回滚**：普通 `git merge`（ff 可行时快进，发散时生成 merge commit）失败则 `git merge --abort`，仓库保持干净；失败时透传 git 的真实输出而非笼统断言冲突（issue #10）
 - **合并后自动清理**：删 worktree → 删分支（`-d` 安全删除，因已合并）→ 解绑会话；拦截随 resolveBinding 返回 null 自动停止
 - **绕过拦截 hook**：merge 用内部 `git()` helper（cwd 显式 = R），不经过 bash 工具的 `tool.execute.before` 改写，不受会话绑定影响
 
-**已实测**（干净仓库 E2E）：prepare → write（落入 worktree）→ merge preview → merge apply → 文件出现在仓库根、worktree 已删、分支已删、state `sessions: {}`。git log 显示 `Merge worktree 'wt/...'`（--no-ff）← `pre-merge snapshot` ← base。
+**已实测**（干净仓库 E2E）：prepare → write（落入 worktree）→ merge preview → merge apply → 文件出现在仓库根、worktree 已删、分支已删、state `sessions: {}`。纯 ff 场景直接快进（无需提交身份，issue #10）；发散场景 git log 显示 `Merge worktree 'wt/...'` ← `pre-merge snapshot` ← base。
 
 ## 16. v0.4 增补：借鉴 zcode-worktree-guard 的多 session 安全机制
 

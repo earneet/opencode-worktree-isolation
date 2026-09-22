@@ -232,6 +232,23 @@ for (const [label, makeHarness] of harnessMakers) {
             )
         })
 
+        test(`interception rewrites a RELATIVE path into the worktree regardless of process cwd (issue #10) (${label})`, async () => {
+            const fileField = h.kind === "v1" ? "filePath" : "path"
+            const args = { [fileField]: "packages/writer/test/rel.test.ts" }
+            await h.intercept("edit", args)
+            assert.equal(
+                args[fileField],
+                path.join(worktreePath, "packages", "writer", "test", "rel.test.ts"),
+                `relative ${fileField} must be anchored at the repo root and rewritten into the worktree, got: ${args[fileField]}`,
+            )
+        })
+
+        test(`interception rewrites a relative glob/grep search path into the worktree (issue #10) (${label})`, async () => {
+            const args = { pattern: "foo", path: "packages" }
+            await h.intercept("grep", args)
+            assert.equal(args.path, path.join(worktreePath, "packages"))
+        })
+
         test(`interception hook injects worktree path for glob without path (${label})`, async () => {
             const args = { pattern: "*.js" }
             await h.intercept("glob", args)
@@ -607,8 +624,281 @@ for (const [label, makeHarness] of harnessMakers) {
             const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/unmerged-keep", force: true })
             assert.ok(cleanup.includes("wt/unmerged-keep: removed"), `force cleanup should succeed, got: ${cleanup}`)
         })
+
+        test(`merge apply creates a merge commit when branches diverged (issue #10) (${label})`, async () => {
+            const prep = await h.prepare({ title: "diverge" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "branch-side.txt"), "branch work\n")
+            assert.ok(git(["add", "-A"], wtPath).ok)
+            assert.ok(git(["commit", "-m", "branch commit"], wtPath).ok)
+
+            writeFileSync(path.join(repoDir, "master-side.txt"), "master work\n")
+            assert.ok(git(["add", "-A"], repoDir).ok)
+            assert.ok(git(["commit", "-m", "master commit"], repoDir).ok)
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(result.startsWith("✅"), `diverged merge should succeed via a merge commit, got:\n${result}`)
+            assert.ok(existsSync(path.join(repoDir, "branch-side.txt")), "branch-side work must land in the repo root")
+            assert.ok(existsSync(path.join(repoDir, "master-side.txt")), "master-side work must survive the merge")
+            assert.match(
+                git(["log", "-1", "--pretty=%s"], repoDir).stdout,
+                /^Merge worktree 'wt\/diverge'/,
+                `HEAD must be the merge commit, got: ${git(["log", "-1", "--pretty=%s"], repoDir).stdout}`,
+            )
+            assert.ok(!git(["rev-parse", "--verify", "wt/diverge"], repoDir).ok, "branch must be deleted")
+        })
+
+        test(`merge apply aborts cleanly on a real conflict and preserves the worktree (issue #10) (${label})`, async () => {
+            const prep = await h.prepare({ title: "conflict" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "README.md"), "branch version\n")
+            assert.ok(git(["add", "-A"], wtPath).ok)
+            assert.ok(git(["commit", "-m", "branch edit"], wtPath).ok)
+            writeFileSync(path.join(repoDir, "README.md"), "master version\n")
+            assert.ok(git(["add", "-A"], repoDir).ok)
+            assert.ok(git(["commit", "-m", "master edit"], repoDir).ok)
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(result.startsWith("❌"), `a real conflict must fail the merge, got:\n${result}`)
+            assert.ok(
+                result.includes("CONFLICT") || /conflict/i.test(result),
+                `git's conflict output must be surfaced, got:\n${result}`,
+            )
+            assert.equal(
+                git(["status", "--porcelain"], repoDir).stdout.trim(),
+                "",
+                "main checkout must be left clean after the abort",
+            )
+            assert.ok(existsSync(wtPath), "worktree must be preserved on conflict")
+            assert.ok(git(["rev-parse", "--verify", "wt/conflict"], repoDir).ok, "branch must be preserved")
+            assert.ok(loadState(pid).sessions[SESSION], "binding must be preserved")
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/conflict", force: true })
+            assert.ok(cleanup.includes("wt/conflict: removed"), `cleanup should finish, got: ${cleanup}`)
+        })
+
+        test(`cleanup keeps a broken worktree by default, but force consent removes it (issue #10 r2) (${label})`, async () => {
+            const prep = await h.prepare({ title: "broken shell" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            // Simulate the aftermath of a partial external deletion (issue #10:
+            // manual robocopy emptied the tree, the .git file was lost): the
+            // directory exists but git cannot operate in it.
+            writeFileSync(path.join(wtPath, "leftover.txt"), "plain\n")
+            unlinkSync(path.join(wtPath, ".git"))
+
+            const cautious = await h.cleanupWorktrees({ action: "apply", branch: "wt/broken-shell" })
+            assert.ok(
+                cautious.includes("snapshot failed") && !cautious.includes("wt/broken-shell: removed"),
+                `default cleanup must refuse to delete a worktree it cannot snapshot, got:\n${cautious}`,
+            )
+            assert.ok(existsSync(wtPath), "worktree must survive the cautious cleanup")
+
+            const auditFile = path.join(process.env.OC_WT_STATE_DIR, `${pid}.audit.jsonl`)
+            const skipEntries = readFileSync(auditFile, "utf8")
+                .split("\n")
+                .filter(Boolean)
+                .map((l) => JSON.parse(l))
+                .filter((e) => e.type === "cleanup_skip" && e.branch === "wt/broken-shell")
+            assert.ok(
+                skipEntries.length >= 1,
+                `the snapshot-failure skip must be audited, got: ${JSON.stringify(skipEntries)}`,
+            )
+            assert.ok(skipEntries[0].err, "the audit entry must carry the failure reason")
+
+            const forced = await h.cleanupWorktrees({ action: "apply", branch: "wt/broken-shell", force: true })
+            assert.ok(
+                forced.includes("wt/broken-shell: removed"),
+                `force expresses consent to discard; removal must proceed, got:\n${forced}`,
+            )
+            assert.ok(forced.includes("snapshot failed"), `the discarded snapshot failure must be reported, got:\n${forced}`)
+            assert.ok(!existsSync(wtPath), "broken shell must be removed by the fallback")
+            assert.ok(!loadState(pid).sessions[SESSION], "binding must be cleared")
+
+            const discardEntries = readFileSync(auditFile, "utf8")
+                .split("\n")
+                .filter(Boolean)
+                .map((l) => JSON.parse(l))
+                .filter((e) => e.type === "cleanup" && e.branch === "wt/broken-shell")
+            assert.ok(
+                discardEntries.length >= 1 && discardEntries[0].snapshotDiscarded,
+                `a forced discard must be audited with snapshotDiscarded, got: ${JSON.stringify(discardEntries)}`,
+            )
+        })
+
+        test(`merge apply self-heals a broken (unsnapshotable) worktree with a loud warning (issue #10 r2) (${label})`, async () => {
+            const prep = await h.prepare({ title: "broken merge" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            writeFileSync(path.join(wtPath, "ff-broken.txt"), "committed work\n")
+            assert.ok(git(["add", "-A"], wtPath).ok)
+            assert.ok(git(["commit", "-m", "work"], wtPath).ok)
+            unlinkSync(path.join(wtPath, ".git"))
+            writeFileSync(path.join(wtPath, "leftover.txt"), "plain\n")
+
+            const result = await h.merge({ action: "apply" })
+            assert.ok(
+                result.startsWith("✅"),
+                `git cannot see any preservable work in a broken worktree; the merge must self-heal, got:\n${result}`,
+            )
+            assert.ok(/could not be inspected|snapshot/.test(result), `the warning must be loud, got:\n${result}`)
+            assert.ok(existsSync(path.join(repoDir, "ff-broken.txt")), "committed branch work must land in the repo root")
+            assert.ok(!existsSync(wtPath), "broken shell must be removed by the fallback")
+            assert.ok(!git(["rev-parse", "--verify", "wt/broken-merge"], repoDir).ok, "branch must be deleted")
+            assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound")
+
+            const auditFile = path.join(process.env.OC_WT_STATE_DIR, `${pid}.audit.jsonl`)
+            const mergeEntries = readFileSync(auditFile, "utf8")
+                .split("\n")
+                .filter(Boolean)
+                .map((l) => JSON.parse(l))
+                .filter((e) => e.type === "merge" && e.branch === "wt/broken-merge")
+            assert.ok(
+                mergeEntries.length >= 1 && mergeEntries[0].snapshotSkipped,
+                `the self-healed merge must audit the skipped snapshot, got: ${JSON.stringify(mergeEntries)}`,
+            )
+        })
+
+        test(`merge preview surfaces git failures instead of "(none — already up to date)" (issue #10) (${label})`, async () => {
+            const prep = await h.prepare({ title: "vanish branch" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            rmSync(wtPath, { recursive: true, force: true })
+            git(["worktree", "prune"], repoDir)
+            assert.ok(git(["branch", "-D", "wt/vanish-branch"], repoDir).ok, "branch must be deletable after worktree removal")
+
+            const result = await h.merge({ action: "preview", branch: "wt/vanish-branch" })
+            assert.ok(
+                !result.includes("already up to date"),
+                `a failed git log must not be reported as "already up to date", got:\n${result}`,
+            )
+            assert.match(result, /git log failed|⚠/, `the failure must be surfaced explicitly, got:\n${result}`)
+
+            const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/vanish-branch", force: true })
+            assert.ok(cleanup.includes("wt/vanish-branch: removed"), `cleanup should finish, got: ${cleanup}`)
+        })
+
+        test(`merge apply still completes when the worktree dir was externally removed (issue #10) (${label})`, async () => {
+            const prep = await h.prepare({ title: "gone dir" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const wtPath = loadState(pid).sessions[SESSION].path
+            rmSync(wtPath, { recursive: true, force: true })
+            git(["worktree", "prune"], repoDir)
+
+            const result = await h.merge({ action: "apply", branch: "wt/gone-dir" })
+            assert.ok(
+                result.startsWith("✅"),
+                `a missing worktree dir must not block merging the surviving branch, got:\n${result}`,
+            )
+            assert.ok(!git(["rev-parse", "--verify", "wt/gone-dir"], repoDir).ok, "branch must be deleted")
+            assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound")
+        })
     })
 }
+
+describe("merge and cleanup without commit identity (issue #10)", () => {
+    const repoDir = path.join(testRoot, "repo-noid")
+    const SESSION = "noid-session"
+    const ID = ["-c", "user.name=tester", "-c", "user.email=t@t"]
+    let h
+    let prevGlobal
+    let prevSystem
+
+    before(async () => {
+        prevGlobal = process.env.GIT_CONFIG_GLOBAL
+        prevSystem = process.env.GIT_CONFIG_SYSTEM
+        process.env.GIT_CONFIG_GLOBAL = path.join(testRoot, "empty.gitconfig")
+        process.env.GIT_CONFIG_SYSTEM = path.join(testRoot, "empty.gitconfig")
+        writeFileSync(path.join(testRoot, "empty.gitconfig"), "")
+
+        mkdirSync(repoDir, { recursive: true })
+        assert.ok(git(["init", "-b", "master"], repoDir).ok, "git init")
+        assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
+        writeFileSync(path.join(repoDir, "README.md"), "# noid repo\n")
+        assert.ok(git(["add", "README.md"], repoDir).ok)
+        assert.ok(git([...ID, "commit", "-m", "initial commit"], repoDir).ok)
+        h = makeV1Harness(repoDir, SESSION)
+        await h.init()
+    })
+
+    after(() => {
+        if (prevGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL
+        else process.env.GIT_CONFIG_GLOBAL = prevGlobal
+        if (prevSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM
+        else process.env.GIT_CONFIG_SYSTEM = prevSystem
+    })
+
+    test("worktree_merge apply succeeds on a pure fast-forward with no git identity configured", async () => {
+        const prep = await h.prepare({ title: "ff noid" })
+        assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[SESSION].path
+        writeFileSync(path.join(wtPath, "ff.txt"), "ff work\n")
+        assert.ok(git(["add", "-A"], wtPath).ok)
+        assert.ok(git([...ID, "commit", "-m", "work"], wtPath).ok)
+
+        const result = await h.merge({ action: "apply" })
+        assert.ok(
+            result.startsWith("✅"),
+            `a pure fast-forward must not require a commit identity, got:\n${result}`,
+        )
+        assert.ok(existsSync(path.join(repoDir, "ff.txt")), "merged file must land in the repo root")
+        assert.ok(!existsSync(wtPath), "worktree must be removed")
+        assert.ok(!git(["rev-parse", "--verify", "wt/ff-noid"], repoDir).ok, "branch must be deleted")
+        assert.ok(!loadState(pid).sessions[SESSION], "session must be unbound")
+    })
+
+    test("cleanup keeps a dirty worktree whose snapshot commit fails (no identity); force consents to discard", async () => {
+        const prep = await h.prepare({ title: "snap fail" })
+        assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[SESSION].path
+        writeFileSync(path.join(wtPath, "dirty.txt"), "uncommitted\n")
+
+        const cautious = await h.cleanupWorktrees({ action: "apply", branch: "wt/snap-fail" })
+        assert.ok(
+            cautious.includes("snapshot failed") && !cautious.includes("wt/snap-fail: removed"),
+            `default cleanup must refuse to delete work it cannot snapshot, got:\n${cautious}`,
+        )
+        assert.ok(existsSync(path.join(wtPath, "dirty.txt")), "worktree and its changes must survive")
+
+        const forced = await h.cleanupWorktrees({ action: "apply", branch: "wt/snap-fail", force: true })
+        assert.ok(
+            forced.includes("wt/snap-fail: removed") && forced.includes("discarded"),
+            `force expresses consent to discard; removal must proceed loudly, got:\n${forced}`,
+        )
+        assert.ok(!existsSync(wtPath), "worktree must be removed under force")
+        assert.ok(!loadState(pid).sessions[SESSION], "binding must be cleared after forced cleanup")
+    })
+
+    test("merge apply blocks (without loss) when a reachable worktree cannot snapshot", async () => {
+        const prep = await h.prepare({ title: "snap block" })
+        assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[SESSION].path
+        writeFileSync(path.join(wtPath, "wip.txt"), "preservable work\n")
+
+        const result = await h.merge({ action: "apply" })
+        assert.ok(
+            result.startsWith("❌") && result.includes("Failed to commit worktree changes"),
+            `a reachable snapshot failure (fixable git config) must block the merge, got:\n${result}`,
+        )
+        assert.ok(existsSync(path.join(wtPath, "wip.txt")), "the uncommitted work must survive")
+        assert.ok(git(["rev-parse", "--verify", "wt/snap-block"], repoDir).ok, "branch must be preserved")
+        assert.ok(loadState(pid).sessions[SESSION], "binding must be preserved")
+
+        const cleanup = await h.cleanupWorktrees({ action: "apply", branch: "wt/snap-block", force: true })
+        assert.ok(cleanup.includes("wt/snap-block: removed"), `force cleanup should finish, got: ${cleanup}`)
+    })
+})
 
 describe("v2 entry specifics", () => {
     const repoDir = path.join(testRoot, "repo-v2-specific")

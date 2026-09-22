@@ -159,13 +159,26 @@ export function computeProjectId(repoRoot: string): string {
     return id
 }
 
+// Windows extended-length prefixes (\\?\ and \\?\UNC\) never match their
+// plain path forms: path.resolve treats them as literal segments and
+// path.relative produces garbage against them. Strip them wherever a path
+// enters path.* arithmetic (issue #10 review r2).
+function stripExtendedLengthPrefix(p: string): string {
+    if (/^\\\\\?\\UNC\\/i.test(p)) return "\\\\" + p.slice(8)
+    if (/^\\\\\?\\/i.test(p)) return p.slice(4)
+    return p
+}
+
 export function norm(p: string): string {
     // Normalize backslashes to forward slashes BEFORE path.resolve(): on POSIX,
     // path.resolve treats "\" as a literal filename character (not a separator), so a
     // Windows-style path like "\tmp\wt" would be seen as relative and prepended with
     // cwd, then never match its forward-slash counterpart. Converting separators first
     // makes matching case-insensitive and cross-separator on every platform.
-    return path.resolve(p.replace(/\\/g, "/")).replace(/\\/g, "/").toLowerCase()
+    return path
+        .resolve(stripExtendedLengthPrefix(p).replace(/\\/g, "/"))
+        .replace(/\\/g, "/")
+        .toLowerCase()
 }
 
 export function isInside(p: string, base: string): boolean {
@@ -466,35 +479,164 @@ export interface RemovalResult {
     err?: string
 }
 
+export interface SnapshotResult {
+    committed: boolean
+    ok: boolean
+    // True when git could not even inspect the worktree (e.g. the .git file
+    // was lost to a partial external deletion): no work is preservable via
+    // git, so callers may choose self-healing over blocking.
+    unreachable?: boolean
+    err?: string
+}
+
+// Snapshot uncommitted worktree changes onto the branch tip before any
+// destructive step. Committing only when something actually changed matters:
+// an unconditional --allow-empty snapshot moved the branch tip past the merge
+// base whenever a later removal failed, flipping the branch from "merged" to
+// "unmerged" between two cleanup calls (issue #10).
+export function commitWorktreeChanges(worktreePath: string, message: string): SnapshotResult {
+    // Guard against two look-alike failures before trusting any git output
+    // (issue #10 r2): a worktree whose .git file was lost may still resolve
+    // through an enclosing repository (git walks up), so `git status` can
+    // succeed against the WRONG repo and snapshot into it; and a corrupt
+    // index makes `git status` fail even though the repo is reachable and its
+    // pending work is preservable. `git rev-parse --show-toplevel` returns
+    // exactly the worktree path only for a functioning worktree repository.
+    const top = git(["rev-parse", "--show-toplevel"], worktreePath)
+    if (!top.ok || norm(top.stdout.trim()) !== norm(worktreePath)) {
+        return {
+            committed: false,
+            ok: false,
+            unreachable: true,
+            err: top.ok
+                ? `git resolved the directory to a different repository root (${top.stdout.trim()})`
+                : (top.stderr || top.stdout).trim() || `git rev-parse failed in ${worktreePath}`,
+        }
+    }
+    const st = git(["status", "--porcelain"], worktreePath)
+    if (!st.ok) {
+        return {
+            committed: false,
+            ok: false,
+            err: (st.stderr || st.stdout).trim() || `git status failed in ${worktreePath}`,
+        }
+    }
+    if (!st.stdout.trim()) return { committed: false, ok: true }
+    const add = git(["add", "-A"], worktreePath)
+    if (!add.ok) {
+        return { committed: false, ok: false, err: (add.stderr || add.stdout).trim() || "git add -A failed" }
+    }
+    const c = git(["commit", "-m", message], worktreePath)
+    if (!c.ok) {
+        // `add -A` can collapse a ghost-dirty index (a staged change whose
+        // worktree content was restored) back onto HEAD, leaving nothing to
+        // commit — the tree ended clean, which is success, not a failure.
+        const recheck = git(["status", "--porcelain"], worktreePath)
+        if (recheck.ok && !recheck.stdout.trim()) {
+            return { committed: false, ok: true }
+        }
+        return { committed: true, ok: false, err: (c.stderr || c.stdout).trim() || "git commit failed" }
+    }
+    return { committed: true, ok: true }
+}
+
+// robocopy /MIR's PURGE follows junctions/symlinks on the target side — /XJ
+// does NOT protect the destination — and would delete files at the link target,
+// e.g. a package manager's junction into the main checkout or a global cache.
+// Strip every reparse point first so the mirror can only ever touch files
+// physically inside the worktree.
+function stripReparsePoints(root: string): number {
+    let failures = 0
+    // The removal root itself may be a junction (external tampering or a
+    // tool mistake): descending into it would enumerate the link TARGET's
+    // contents and never notice the link, so robocopy's PURGE would wipe the
+    // target afterwards. Treat a root link as a strip failure — the
+    // rmSync-only path that then runs never follows links.
+    try {
+        if (lstatSync(root).isSymbolicLink()) return 1
+    } catch {
+        return 0
+    }
+    const stack: string[] = [root]
+    while (stack.length) {
+        const dir = stack.pop()!
+        let names: string[]
+        try {
+            names = readdirSync(dir)
+        } catch (e) {
+            // An uninspectable directory may hide links from us; count it so
+            // the robocopy mirror stays skipped (failing safely beats purging
+            // a link target). ENOENT is a benign delete race, not a hazard.
+            if ((e as NodeJS.ErrnoException).code !== "ENOENT") failures++
+            continue
+        }
+        for (const name of names) {
+            const p = path.join(dir, name)
+            let st
+            try {
+                st = lstatSync(p)
+            } catch (e) {
+                if ((e as NodeJS.ErrnoException).code !== "ENOENT") failures++
+                continue
+            }
+            if (st.isSymbolicLink()) {
+                try {
+                    unlinkSync(p)
+                } catch {
+                    failures++
+                }
+                continue
+            }
+            if (st.isDirectory()) stack.push(p)
+        }
+    }
+    return failures
+}
+
 // `git worktree remove` fails with "Filename too long" on Windows when the tree
 // contains untracked paths beyond MAX_PATH (e.g. bun's isolated node_modules
 // layout). robocopy mirrors against an empty dir — robocopy internally uses
 // long-path-capable APIs — leaving an empty shell that rmSync can remove.
 export function removeWorktreeDir(target: string): RemovalResult {
     if (!existsSync(target)) return { ok: true, method: "already-missing" }
+    let robocopyErr: string | undefined
     if (IS_WIN) {
-        const empty = mkdtempSync(path.join(tmpdir(), "wt-mirror-empty-"))
-        try {
-            const r = spawnSync(
-                "robocopy",
-                [empty, target, "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:2", "/W:1"],
-                { encoding: "utf8" },
-            )
-            // robocopy exit codes 0-7 are success; >=8 signals failure
-            if (r.error) return { ok: false, method: "robocopy", err: String(r.error) }
-            if ((r.status ?? 8) >= 8) {
-                return { ok: false, method: "robocopy", err: (r.stderr || "").trim() || `exit code ${r.status}` }
-            }
-        } finally {
+        const stripFailures = stripReparsePoints(target)
+        if (stripFailures > 0) {
+            // A junction that could not be unlinked would be followed by
+            // robocopy /MIR's PURGE into its target. Skip the mirror entirely
+            // and let rmSync (which never follows links) handle removal;
+            // failing safely beats deleting files at a link target.
+            robocopyErr = `${stripFailures} reparse point(s) could not be stripped; robocopy skipped to protect their targets`
+        } else {
+            const empty = mkdtempSync(path.join(tmpdir(), "wt-mirror-empty-"))
             try {
-                rmSync(empty, { recursive: true, force: true })
-            } catch {}
+                // Output is discarded: /MIR prints one "*EXTRA File" line per purged
+                // file (not suppressed by /NFL), which overflows spawnSync's default
+                // 1MB maxBuffer on large node_modules trees (issue #10 ENOBUFS).
+                const r = spawnSync(
+                    "robocopy",
+                    [empty, target, "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:2", "/W:1"],
+                    { stdio: "ignore" },
+                )
+                if (r.error) robocopyErr = String(r.error)
+                else if ((r.status ?? 8) >= 8) robocopyErr = `exit code ${r.status}`
+            } finally {
+                try {
+                    rmSync(empty, { recursive: true, force: true })
+                } catch {}
+            }
         }
     }
     try {
         rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
     } catch (e) {
-        return { ok: false, method: "rmSync", err: (e as Error).message }
+        const rmErr = (e as Error).message
+        return {
+            ok: false,
+            method: IS_WIN ? "robocopy-mirror" : "rmSync",
+            err: robocopyErr ? `${robocopyErr}; rmSync: ${rmErr}` : rmErr,
+        }
     }
     return { ok: true, method: IS_WIN ? "robocopy-mirror" : "rmSync" }
 }
@@ -514,7 +656,18 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
     }
 }
 
-export function decidePathAction(target: string, ctx: DecisionContext): DecisionResult {
+export function decidePathAction(rawTarget: string, ctx: DecisionContext): DecisionResult {
+    // Harness file tools resolve repo-relative paths against the session's
+    // project directory, never against process.cwd() (a daemon's cwd is
+    // unrelated to the project). Anchor relative targets at the repo root the
+    // same way before matching, or they slip through as "outside-repo" and
+    // silently hit the main checkout (issue #10). path.resolve also turns
+    // drive-relative forms ("C:foo") into absolute paths resolved against
+    // that drive's cwd — typically outside this repo, i.e. passthrough —
+    // instead of producing an invalid repo-root-relative concatenation.
+    const target = path.isAbsolute(rawTarget)
+        ? stripExtendedLengthPrefix(rawTarget)
+        : path.resolve(ctx.repoRoot, rawTarget)
     if (isDotGitPath(target)) {
         return { action: "deny", reason: `[worktree] access to .git paths is blocked: ${target}` }
     }
@@ -565,12 +718,13 @@ export function decideSearchPathAction(
     worktreePath: string,
 ): SearchPathResult {
     if (!p) return { action: "inject", newPath: worktreePath }
-    if (isDotGitPath(p)) {
+    const resolved = path.isAbsolute(p) ? stripExtendedLengthPrefix(p) : path.resolve(repoRoot, p)
+    if (isDotGitPath(resolved)) {
         return { action: "allow" }
     }
-    if (isInside(p, worktreePath)) return { action: "allow" }
-    if (isInside(p, repoRoot)) {
-        const rel = path.relative(repoRoot, p)
+    if (isInside(resolved, worktreePath)) return { action: "allow" }
+    if (isInside(resolved, repoRoot)) {
+        const rel = path.relative(repoRoot, resolved)
         return { action: "rewrite", newPath: path.join(worktreePath, rel) }
     }
     return { action: "allow" }
