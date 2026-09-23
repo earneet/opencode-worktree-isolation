@@ -213,6 +213,40 @@ export function repoRootRegex(repoRoot: string): RegExp {
     return new RegExp(escapeRegex(fwd) + "|" + escapeRegex(back), "gi")
 }
 
+// Shell command-text rewrites must never be silent: a `git -C <main-checkout>
+// status` that was redirected to the worktree reads as the main checkout's
+// state otherwise, which misattributes verification output (issue #11).
+export function shellRewriteNotice(repoRoot: string, worktreePath: string): string {
+    return (
+        `[worktree] command rewritten: the main-checkout path in this command was redirected to the ` +
+        `worktree (${repoRoot} -> ${worktreePath}). The output below reflects the WORKTREE, not the main checkout.\n`
+    )
+}
+
+// The after-hook result shape differs across hosts/versions (content string,
+// content parts array, plain string output, structured bash output). Mutate
+// whichever field carries the model-facing text; if none matches, the notice
+// simply does not surface (audit still recorded) instead of breaking output.
+export function injectShellRewriteNotice(result: { output?: unknown; content?: unknown }, notice: string): void {
+    if (typeof result.content === "string") {
+        result.content = notice + result.content
+        return
+    }
+    if (Array.isArray(result.content)) {
+        const parts = result.content as Array<{ type: string; text?: string }>
+        result.content = [{ type: "text", text: notice }, ...parts]
+        return
+    }
+    if (typeof result.output === "string") {
+        result.output = notice + result.output
+        return
+    }
+    if (result.output !== null && typeof result.output === "object") {
+        const out = result.output as { output?: unknown }
+        if (typeof out.output === "string") out.output = notice + out.output
+    }
+}
+
 export function matchGlob(target: string, pattern: string): boolean {
     let re = ""
     let i = 0

@@ -70,6 +70,9 @@ function makeV1Harness(repoDir, SESSION) {
         async intercept(tool, args, sid = SESSION) {
             await hooks["tool.execute.before"]({ tool, sessionID: sid, callID: "c" }, { args })
         },
+        async afterTool(tool, output, sid = SESSION) {
+            await hooks["tool.execute.after"]({ tool, sessionID: sid, callID: "c", args: {} }, output)
+        },
         async systemPrompt(sid = SESSION) {
             const output = { system: [] }
             await hooks["experimental.chat.system.transform"]({ sessionID: sid }, output)
@@ -146,6 +149,9 @@ function makeV2Harness(repoDir, SESSION) {
         allow: (args, sid = SESSION) => unwrap(tools.get("worktree_allow").execute(args, callCtx(sid))),
         async intercept(tool, args, sid = SESSION) {
             await toolHooks.get("execute.before")({ tool, ...callCtx(sid), input: args })
+        },
+        async afterTool(tool, result, sid = SESSION) {
+            await toolHooks.get("execute.after")({ tool, ...callCtx(sid), input: {}, status: "completed", result })
         },
         async systemPrompt(sid = SESSION) {
             const event = {
@@ -265,6 +271,33 @@ for (const [label, makeHarness] of harnessMakers) {
         test(`interception hook denies patch while a worktree is bound (${label})`, async () => {
             const args = { patchText: "*** Update File: src/foo.ts\n@@" }
             await assert.rejects(() => h.intercept("patch", args), /patch tool cannot be redirected/)
+        })
+
+        test(`shell command rewrite surfaces a notice in the output instead of staying silent (issue #11) (${label})`, async () => {
+            const tool = h.kind === "v1" ? "bash" : "shell"
+            const args = { command: "git -C " + repoDir + " status --porcelain" }
+            await h.intercept(tool, args)
+            assert.ok(!args.command.includes(repoDir), "main-checkout path must be gone from the command")
+            assert.ok(args.command.includes(worktreePath), "command must target the worktree")
+
+            const mkOutput = (text) => (h.kind === "v1" ? { title: "", output: text, metadata: {} } : { content: text })
+            const textOf = (o) => (h.kind === "v1" ? o.output : o.content)
+
+            const output = mkOutput("M  feature.txt\n")
+            await h.afterTool(tool, output)
+            assert.ok(textOf(output).startsWith("[worktree]"), `rewrite notice must be prepended, got: ${textOf(output)}`)
+            assert.ok(textOf(output).includes(worktreePath), "notice must name the worktree")
+            assert.ok(textOf(output).includes("M  feature.txt"), "original output must survive the injection")
+
+            const secondRun = mkOutput("clean\n")
+            await h.afterTool(tool, secondRun)
+            assert.equal(textOf(secondRun), "clean\n", "notice is consumed once per call, not re-injected")
+
+            const plain = { command: "echo hi" }
+            await h.intercept(tool, plain)
+            const cleanOutput = mkOutput("hi\n")
+            await h.afterTool(tool, cleanOutput)
+            assert.equal(textOf(cleanOutput), "hi\n", "commands that were not rewritten get no notice")
         })
 
         test(`system prompt announces the active worktree (${label})`, async () => {

@@ -81,7 +81,13 @@ export const v1Plugin: Plugin = async (ctx) => {
         },
 
         "tool.execute.before": async (input, output) => {
-            await core.intercept(input?.tool, input?.sessionID, output?.args)
+            await core.intercept(input?.tool, input?.sessionID, output?.args, input?.callID)
+        },
+
+        "tool.execute.after": async (input, output) => {
+            const notice = core.takeShellRewriteNotice(input?.callID ?? "")
+            if (!notice || !output || typeof output.output !== "string") return
+            output.output = notice + output.output
         },
 
         "experimental.chat.system.transform": async (input, output) => {

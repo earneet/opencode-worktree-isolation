@@ -14,6 +14,8 @@ import {
     slugify,
     applyInterception,
     repoRootRegex,
+    shellRewriteNotice,
+    injectShellRewriteNotice,
     resolveWorktreeRoot,
     escapeRegex,
     atomicWriteFileSync,
@@ -357,6 +359,45 @@ test("applyInterception: shell command containing repo root is rewritten", () =>
     applyInterception("shell", args, INT_CTX)
     assert.ok(!repoRootRegex(REPO).test(args.command), "repo root should be gone")
     assert.ok(args.command.includes(WT), "worktree path should be present")
+})
+
+test("shellRewriteNotice: names the worktree and the main checkout (issue #11)", () => {
+    const notice = shellRewriteNotice(REPO, WT)
+    assert.ok(notice.startsWith("[worktree]"))
+    assert.ok(notice.includes(WT))
+    assert.ok(notice.includes(REPO))
+    assert.ok(notice.endsWith("\n"), "notice ends with a newline so it never merges into output line 1")
+})
+
+test("injectShellRewriteNotice: prepends to string content", () => {
+    const result = { content: "M  file.txt\n" }
+    injectShellRewriteNotice(result, "NOTICE\n")
+    assert.equal(result.content, "NOTICE\nM  file.txt\n")
+})
+
+test("injectShellRewriteNotice: inserts a text part in front of a content array", () => {
+    const result = { content: [{ type: "text", text: "out" }] }
+    injectShellRewriteNotice(result, "NOTICE\n")
+    assert.deepEqual(result.content, [{ type: "text", text: "NOTICE\n" }, { type: "text", text: "out" }])
+})
+
+test("injectShellRewriteNotice: prepends to plain string output", () => {
+    const result = { output: "out" }
+    injectShellRewriteNotice(result, "NOTICE\n")
+    assert.equal(result.output, "NOTICE\nout")
+})
+
+test("injectShellRewriteNotice: handles structured bash output (.output.output)", () => {
+    const result = { output: { exit: 0, truncated: false, output: "out" } }
+    injectShellRewriteNotice(result, "NOTICE\n")
+    assert.equal(result.output.output, "NOTICE\nout")
+})
+
+test("injectShellRewriteNotice: unknown shapes are left untouched without throwing", () => {
+    assert.doesNotThrow(() => injectShellRewriteNotice({}, "NOTICE\n"))
+    const numeric = { output: 42 }
+    assert.doesNotThrow(() => injectShellRewriteNotice(numeric, "NOTICE\n"))
+    assert.equal(numeric.output, 42)
 })
 
 test("applyInterception: patch while bound is denied (patchText cannot be rewritten)", () => {

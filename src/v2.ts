@@ -4,6 +4,7 @@
 // against the same interface define() would return.
 import type { Plugin as PluginNamespace } from "@opencode/plugin"
 import { createCore, DESCRIPTIONS, ARG_DESCRIPTIONS } from "./core.js"
+import { injectShellRewriteNotice } from "./lib.js"
 import type { AllowArgs, CleanupArgs, CoreCall, MergeArgs, PrepareArgs } from "./core.js"
 
 const PREPARE_INPUT = {
@@ -115,7 +116,16 @@ export const v2Plugin: PluginNamespace.Plugin = {
         })
 
         await ctx.tool.hook("execute.before", async (event) => {
-            await core.intercept(event.tool, event.sessionID, event.input)
+            await core.intercept(event.tool, event.sessionID, event.input, event.id)
+        })
+
+        await ctx.tool.hook("execute.after", async (event) => {
+            if (event.status !== "completed") {
+                core.takeShellRewriteNotice(event.id)
+                return
+            }
+            const notice = core.takeShellRewriteNotice(event.id)
+            if (notice) injectShellRewriteNotice(event.result, notice)
         })
 
         await ctx.session.hook("context", async (event) => {

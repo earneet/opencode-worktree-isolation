@@ -25,6 +25,7 @@ import {
     norm,
     findSessionsForWorktree,
     mergedBranchSet,
+    shellRewriteNotice,
 } from "./lib.js"
 import type { DecisionContext, MutableToolArgs, SessionBinding, SnapshotResult, WorktreeState } from "./lib.js"
 
@@ -119,7 +120,11 @@ export interface WorktreeCore {
     cleanup(args: CleanupArgs, call: CoreCall): Promise<string>
     merge(args: MergeArgs, call: CoreCall): Promise<string>
     allow(args: AllowArgs, call: CoreCall): Promise<string>
-    intercept(toolName: unknown, sessionId: unknown, args: unknown): Promise<void>
+    intercept(toolName: unknown, sessionId: unknown, args: unknown, callID?: unknown): Promise<void>
+    // Pops the rewrite notice recorded for a tool call. The execute.after hook
+    // uses this to prepend the notice to the tool output, making shell text
+    // rewrites visible instead of silent (issue #11).
+    takeShellRewriteNotice(callID: string): string | null
     systemPromptText(sessionId: string | undefined | null): Promise<string | null>
     onSessionIdle(sessionId: string): void
     onSessionDeleted(sessionId: string): void
@@ -133,6 +138,9 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     const stateBackend = createStateBackend(repoRoot, cfg)
 
     const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
+
+    // Notices waiting for the matching execute.after hook, keyed by tool callID.
+    const pendingShellRewrites = new Map<string, string>()
 
     const releaseBinding = (sid: string, reason: string, auditType: "binding_released" | "binding_expired") => {
         stateBackend.clearBinding(sid)
@@ -742,7 +750,7 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         )
     }
 
-    async function intercept(toolName: unknown, sessionId: unknown, args: unknown): Promise<void> {
+    async function intercept(toolName: unknown, sessionId: unknown, args: unknown, callID?: unknown): Promise<void> {
         if (typeof toolName !== "string" || typeof sessionId !== "string" || !sessionId) return
         if (toolName.startsWith("worktree_")) return
         const toolArgs = args as MutableToolArgs
@@ -761,6 +769,8 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             protectedBranches: cfg.protectedBranches,
             allowlistMatcher: (p: string) => isAllowlisted(p, effectiveRoot, allowlist),
         }
+        const isShellTool = toolName === "bash" || toolName === "shell"
+        const commandBefore = isShellTool && typeof toolArgs.command === "string" ? toolArgs.command : undefined
         try {
             applyInterception(toolName, toolArgs, ctx)
         } catch (e) {
@@ -775,6 +785,29 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             }
             throw e
         }
+        if (commandBefore !== undefined && ctx.worktreePath && toolArgs.command !== commandBefore) {
+            const notice = shellRewriteNotice(effectiveRoot, ctx.worktreePath)
+            stateBackend.appendAudit({
+                type: "shell_rewrite",
+                sessionId,
+                toolName,
+                from: effectiveRoot,
+                to: ctx.worktreePath,
+            })
+            if (typeof callID === "string" && callID) {
+                if (pendingShellRewrites.size >= 256) {
+                    const oldest = pendingShellRewrites.keys().next().value
+                    if (oldest !== undefined) pendingShellRewrites.delete(oldest)
+                }
+                pendingShellRewrites.set(callID, notice)
+            }
+        }
+    }
+
+    function takeShellRewriteNotice(callID: string): string | null {
+        const notice = pendingShellRewrites.get(callID) ?? null
+        pendingShellRewrites.delete(callID)
+        return notice
     }
 
     async function systemPromptText(sessionId: string | undefined | null): Promise<string | null> {
@@ -833,6 +866,7 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         merge,
         allow,
         intercept,
+        takeShellRewriteNotice,
         systemPromptText,
         onSessionIdle,
         onSessionDeleted,
