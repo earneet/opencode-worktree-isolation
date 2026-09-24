@@ -1744,3 +1744,33 @@ describe("commitWorktreeChanges (issue #10)", () => {
         }
     })
 })
+
+test("lib: every spawnSync call site passes windowsHide: true (issue #12)", () => {
+    // The plugin runs inside opencode's console-less server process; on Windows
+    // a spawnSync without CREATE_NO_WINDOW (windowsHide) attaches a fresh
+    // console to every child, which Windows Terminal hosts as a visible window
+    // that flashes on screen. The flash itself needs a GUI session to observe,
+    // so this guards the shipped source instead: every call site must pass
+    // windowsHide: true. Scans the built artifact because that is what npm
+    // ships and what `npm test` rebuilds before running this suite.
+    const src = readFileSync(new URL("../dist/lib.js", import.meta.url), "utf8")
+    const callSites = []
+    let i = 0
+    while ((i = src.indexOf("spawnSync(", i)) !== -1) {
+        let depth = 0
+        let j = i + "spawnSync(".length - 1
+        for (; j < src.length; j++) {
+            if (src[j] === "(") depth++
+            else if (src[j] === ")" && --depth === 0) break
+        }
+        callSites.push(src.slice(i, j + 1))
+        i = j
+    }
+    assert.ok(
+        callSites.length >= 4,
+        `expected at least the 4 known spawnSync call sites (git/hooks cmd/hooks bash/robocopy), found ${callSites.length}`,
+    )
+    for (const call of callSites) {
+        assert.match(call, /windowsHide:\s*true/, `missing windowsHide: true in spawnSync call`)
+    }
+})

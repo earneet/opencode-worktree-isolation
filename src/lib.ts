@@ -135,7 +135,7 @@ export function getStateDir(): string {
 }
 
 export function git(args: string[], cwd: string): GitResult {
-    const r = spawnSync("git", args, { cwd, encoding: "utf8" })
+    const r = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true })
     if (r.error) return { ok: false, stdout: "", stderr: String(r.error) }
     if (r.status !== 0) return { ok: false, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
     return { ok: true, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
@@ -402,8 +402,8 @@ export function resolveWorktreeRoot(raw: string | null | undefined, repoRoot: st
 
 export function runHookCommands(commands: string[], cwd: string): void {
     for (const cmd of commands) {
-        if (IS_WIN) spawnSync("cmd", ["/d", "/c", cmd], { cwd, stdio: "ignore" })
-        else spawnSync("bash", ["-c", cmd], { cwd, stdio: "ignore" })
+        if (IS_WIN) spawnSync("cmd", ["/d", "/c", cmd], { cwd, stdio: "ignore", windowsHide: true })
+        else spawnSync("bash", ["-c", cmd], { cwd, stdio: "ignore", windowsHide: true })
     }
 }
 
@@ -668,7 +668,7 @@ export function removeWorktreeDir(target: string): RemovalResult {
                 const r = spawnSync(
                     "robocopy",
                     [empty, target, "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:2", "/W:1"],
-                    { stdio: "ignore" },
+                    { stdio: "ignore", windowsHide: true },
                 )
                 if (r.error) robocopyErr = String(r.error)
                 else if ((r.status ?? 8) >= 8) robocopyErr = `exit code ${r.status}`
