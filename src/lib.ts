@@ -176,10 +176,19 @@ export function norm(p: string): string {
     // Windows-style path like "\tmp\wt" would be seen as relative and prepended with
     // cwd, then never match its forward-slash counterpart. Converting separators first
     // makes matching case-insensitive and cross-separator on every platform.
-    return path
+    const n = path
         .resolve(stripExtendedLengthPrefix(p).replace(/\\/g, "/"))
         .replace(/\\/g, "/")
         .toLowerCase()
+    // Win32 strips trailing dots/spaces from every path component, so
+    // "R/.git./hooks" physically targets "R/.git/hooks"; skipping this fold let
+    // such forms slip past the .git guard (review 2026-10-30, P0-2). POSIX
+    // keeps them literal, so only fold on Windows.
+    if (!IS_WIN) return n
+    return n
+        .split("/")
+        .map((seg) => seg.replace(/[. ]+$/, ""))
+        .join("/")
 }
 
 export function isInside(p: string, base: string): boolean {
@@ -781,69 +790,155 @@ export function decideSearchPathAction(
     return { action: "allow" }
 }
 
-const GIT_PREFIX = String.raw`\bgit\s+(?:(?:-C|-c)\s+\S+\s+)*`
-const GIT_MUTATE_RE = new RegExp(GIT_PREFIX + String.raw`(merge|rebase|pull)\b`, "i")
-const GIT_PUSH_PROTECTED_RE = /\bgit\s+push\b.*\b(master|main)\b/i
-const GIT_PUSH_DEFAULT_RE = /^\s*git\s+push\s*$/i
-const GIT_CHECKOUT_RE = new RegExp(
-    GIT_PREFIX + String.raw`(checkout|switch)\s+([^\s;|&"'<>()-][^\s;|&"'<>()]*)`,
-    "i",
-)
-const GIT_DEL_BRANCH_RE = new RegExp(
-    String.raw`\bgit\s+branch\s+(-[dD])\s+([^\s;|&"'<>()]+)\b`,
-    "i",
-)
+// master/main are protected even when protectedBranches is empty: the
+// documented "hardcoded safety net" (README). Unioned here so every decision
+// below shares it (review 2026-10-30, P0-1).
+const HARD_PROTECTED_BRANCHES = ["master", "main"]
+
+// git accepts global options before the subcommand; these consume a value.
+const GIT_VALUE_GLOBALS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"])
+
+interface GitInvocation {
+    verb: string
+    args: string[]
+}
+
+function shellSegments(cmd: string): string[] {
+    return cmd.split(/;|\|\||&&|&|\||\r?\n/)
+}
+
+function gitInvocations(tokens: string[]): GitInvocation[] {
+    const found: GitInvocation[] = []
+    for (let i = 0; i < tokens.length; i++) {
+        if (tokens[i].toLowerCase() !== "git") continue
+        let j = i + 1
+        while (j < tokens.length) {
+            const t = tokens[j].toLowerCase()
+            if (GIT_VALUE_GLOBALS.has(t)) {
+                j += 2
+                continue
+            }
+            if (t.startsWith("--") && t.includes("=")) {
+                j += 1
+                continue
+            }
+            if (t.startsWith("-")) {
+                j += 1
+                continue
+            }
+            break
+        }
+        if (j >= tokens.length) continue
+        found.push({ verb: tokens[j].toLowerCase(), args: tokens.slice(j + 1) })
+        i = j
+    }
+    return found
+}
+
+function pushRefspecHits(refspec: string, protectedSet: Set<string>): boolean {
+    const parts = refspec.replace(/^\+/, "").split(":")
+    for (let part of parts) {
+        if (part.startsWith("refs/heads/")) part = part.slice("refs/heads/".length)
+        if (part && protectedSet.has(part.toLowerCase())) return true
+    }
+    return false
+}
 
 export function decideBashAction(ctx: BashDecisionContext): DecisionResult {
     if (!ctx.strictGitOps) return { action: "allow", source: "strictGitOps-off" }
 
+    const protectedSet = new Set([...ctx.protectedBranches, ...HARD_PROTECTED_BRANCHES])
     const branchL = ctx.currentBranch.toLowerCase()
-    const cmd = ctx.command
+    const onProtected = protectedSet.has(branchL)
 
-    if (GIT_PUSH_PROTECTED_RE.test(cmd) ||
-        (GIT_PUSH_DEFAULT_RE.test(cmd) && ctx.protectedBranches.has(branchL))) {
-        return {
-            action: "deny",
-            reason: `[worktree] git push to protected branch (${ctx.currentBranch}) is blocked in strictGitOps mode.`,
-        }
-    }
+    for (const segment of shellSegments(ctx.command)) {
+        const tokens = segment.trim().split(/\s+/).filter(Boolean)
+        for (const { verb, args } of gitInvocations(tokens)) {
+            const operands = args.filter((a) => !a.startsWith("-"))
+            const flags = args.filter((a) => a.startsWith("-"))
 
-    if (GIT_MUTATE_RE.test(cmd) && ctx.protectedBranches.has(branchL)) {
-        return {
-            action: "deny",
-            reason: `[worktree] merge/rebase/pull on protected branch (${ctx.currentBranch}) is blocked in strictGitOps mode.`,
-        }
-    }
+            if (verb === "push") {
+                // With no explicit refspec (bare, flags-only, or remote-only)
+                // git pushes the current branch.
+                const refspecs = operands.length >= 2 ? operands.slice(1) : []
+                if (refspecs.length === 0) {
+                    if (onProtected) {
+                        return {
+                            action: "deny",
+                            reason: `[worktree] git push to protected branch (${ctx.currentBranch}) is blocked in strictGitOps mode.`,
+                        }
+                    }
+                } else if (refspecs.some((r) => pushRefspecHits(r, protectedSet))) {
+                    return {
+                        action: "deny",
+                        reason: `[worktree] git push to protected branch is blocked in strictGitOps mode.`,
+                    }
+                }
+                continue
+            }
 
-    if (ctx.hasBinding) {
-        const m = GIT_CHECKOUT_RE.exec(cmd)
-        if (m && ctx.protectedBranches.has(m[2].toLowerCase())) {
-            return {
-                action: "deny",
-                reason: `[worktree] git checkout/switch to protected branch (${m[2]}) is blocked while a worktree is bound.`,
+            if (verb === "merge" || verb === "rebase" || verb === "pull") {
+                if (onProtected) {
+                    return {
+                        action: "deny",
+                        reason: `[worktree] merge/rebase/pull on protected branch (${ctx.currentBranch}) is blocked in strictGitOps mode.`,
+                    }
+                }
+                continue
+            }
+
+            if (verb === "checkout" || verb === "switch") {
+                if (ctx.hasBinding) {
+                    const target = operands.find((o) => protectedSet.has(o.toLowerCase()))
+                    if (target) {
+                        return {
+                            action: "deny",
+                            reason: `[worktree] git checkout/switch to protected branch (${target}) is blocked while a worktree is bound.`,
+                        }
+                    }
+                }
+                continue
+            }
+
+            if (verb === "branch") {
+                // Bundled shorts like -df count too: scan every char after "-".
+                const shortBundle = flags.find((f) => /^-[^-]/.test(f) && /[dDfFmM]/.test(f.slice(1)))
+                const deletes =
+                    (shortBundle !== undefined && /[dD]/.test(shortBundle.slice(1))) ||
+                    flags.includes("--delete") ||
+                    flags.includes("--force-delete")
+                if (deletes) {
+                    return {
+                        action: "deny",
+                        reason: `[worktree] git branch -d/-D is blocked in strictGitOps mode (use worktree_cleanup instead).`,
+                    }
+                }
+                const mutates =
+                    (shortBundle !== undefined && /[fFmM]/.test(shortBundle.slice(1))) ||
+                    flags.includes("--force") ||
+                    flags.includes("--move") ||
+                    flags.includes("--rename")
+                if (mutates && operands.some((o) => protectedSet.has(o.toLowerCase()))) {
+                    return {
+                        action: "deny",
+                        reason: `[worktree] git branch --force/--move on protected branch is blocked in strictGitOps mode.`,
+                    }
+                }
+                continue
             }
         }
     }
-
-    const delM = GIT_DEL_BRANCH_RE.exec(cmd)
-    if (delM) {
-        return {
-            action: "deny",
-            reason: `[worktree] git branch -d/-D is blocked in strictGitOps mode (use worktree_cleanup instead).`,
-        }
-    }
-
     return { action: "allow", source: "bash-no-violation" }
 }
 
-const branchCache = new Map<string, string>()
-
 export function currentBranch(repoRoot: string): string {
-    if (branchCache.has(repoRoot)) return branchCache.get(repoRoot)!
+    // Deliberately uncached: hosts are long-lived daemons and the main checkout
+    // can switch branches at any time; a process-lifetime cache let protected-
+    // branch checks pass against the branch the user was on earlier (review
+    // 2026-10-30). This only runs on the strictGitOps bash path, so the
+    // spawnSync cost is bounded.
     const r = git(["symbolic-ref", "--short", "HEAD"], repoRoot)
-    const branch = r.ok ? r.stdout.trim() : "(detached HEAD)"
-    branchCache.set(repoRoot, branch)
-    return branch
+    return r.ok ? r.stdout.trim() : "(detached HEAD)"
 }
 
 export function applyInterception(

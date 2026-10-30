@@ -935,7 +935,151 @@ describe("decideBashAction", () => {
             command: "cd x && git merge y",
             currentBranch: "feature",
         }))
-        assert.equal(r.action, "allow", "current branch not in protected set → merge is allowed even though regex matches")
+        assert.equal(r.action, "allow", "current branch not in protected set → merge is allowed even though the command is recognized")
+    })
+
+    const EMPTY = new Set()
+
+    test("hardcoded safety net: empty protectedBranches still blocks merge on master", () => {
+        const r = decideBashAction(mkCtx({ command: "git merge feature", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("hardcoded safety net: bare git push on master with empty config → deny", () => {
+        const r = decideBashAction(mkCtx({ command: "git push", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push origin (remote-only, implicit refspec) on master → deny", () => {
+        const r = decideBashAction(mkCtx({ command: "git push origin", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push -f on master → deny", () => {
+        const r = decideBashAction(mkCtx({ command: "git push -f", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push -u origin on master → deny", () => {
+        const r = decideBashAction(mkCtx({ command: "git push -u origin", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push origin HEAD:main → deny (refspec dst is hardcoded-protected)", () => {
+        const r = decideBashAction(mkCtx({ command: "git push origin HEAD:main", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push origin release/1.0 with configured protectedBranches → deny", () => {
+        const r = decideBashAction(mkCtx({
+            command: "git push origin release/1.0",
+            currentBranch: "feature",
+            protectedBranches: new Set(["release/1.0"]),
+        }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("compound 'cd x && git push origin' on master → deny", () => {
+        const r = decideBashAction(mkCtx({ command: "cd x && git push origin", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git push origin feature on master with empty config → allow (only master/main are hardcoded)", () => {
+        const r = decideBashAction(mkCtx({ command: "git push origin feature", protectedBranches: EMPTY }))
+        assert.equal(r.action, "allow")
+    })
+
+    test("git -C <path> merge y on master → deny (global options skipped before the verb)", () => {
+        const r = decideBashAction(mkCtx({ command: "git -C /some/where merge y" }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git branch -f master HEAD → deny (force-moving a protected branch)", () => {
+        const r = decideBashAction(mkCtx({ command: "git branch -f master HEAD", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git branch --delete wt/x → deny (long option form)", () => {
+        const r = decideBashAction(mkCtx({ command: "git branch --delete wt/x", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git branch -df wt/x → deny (bundled short flags)", () => {
+        const r = decideBashAction(mkCtx({ command: "git branch -df wt/x", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git branch -m master renamed → deny (renaming a protected branch away)", () => {
+        const r = decideBashAction(mkCtx({ command: "git branch -m master renamed", protectedBranches: EMPTY }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git branch -v → allow (non-mutating listing flag)", () => {
+        const r = decideBashAction(mkCtx({ command: "git branch -v", protectedBranches: EMPTY }))
+        assert.equal(r.action, "allow")
+    })
+
+    test("git switch -C master with binding → deny (option form)", () => {
+        const r = decideBashAction(mkCtx({
+            command: "git switch -C master",
+            hasBinding: true,
+            protectedBranches: EMPTY,
+        }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git checkout -B master with binding → deny (option form)", () => {
+        const r = decideBashAction(mkCtx({
+            command: "git checkout -B master",
+            hasBinding: true,
+            protectedBranches: EMPTY,
+        }))
+        assert.equal(r.action, "deny")
+    })
+
+    test("git checkout -b newbranch with binding → allow (target not protected)", () => {
+        const r = decideBashAction(mkCtx({
+            command: "git checkout -b newbranch",
+            hasBinding: true,
+        }))
+        assert.equal(r.action, "allow")
+    })
+
+    test("git checkout master.txt with binding → allow (exact token match only)", () => {
+        const r = decideBashAction(mkCtx({
+            command: "git checkout master.txt",
+            hasBinding: true,
+        }))
+        assert.equal(r.action, "allow")
+    })
+})
+
+describe("norm() Win32 trailing dots and spaces (review P0-2)", () => {
+    test("'.git.' segment is treated as .git on Windows, stays literal on POSIX", () => {
+        if (process.platform === "win32") {
+            assert.equal(isDotGitPath("F:/repo/.git./hooks/x"), true, "'.git.' must fold to '.git' on win32")
+            assert.equal(isDotGitPath("F:/repo/.git /hooks/x"), true, "'.git ' must fold to '.git' on win32")
+        } else {
+            assert.equal(isDotGitPath("/repo/.git./hooks/x"), false, "POSIX keeps '.git.' literal")
+        }
+    })
+
+    test("non-.git segments are unaffected by the fold", () => {
+        assert.equal(isDotGitPath("F:/repo/src/.gitignore"), false)
+        assert.equal(isDotGitPath("F:/repo/.github/workflows/ci.yml"), false)
+    })
+
+    test("containment checks follow Win32 trailing-dot semantics on Windows", () => {
+        if (process.platform === "win32") {
+            assert.equal(isInside("F:/workspace./repo/x", "F:/workspace/repo"), true,
+                "'workspace.' must fold to 'workspace' on win32")
+        } else {
+            assert.equal(isInside("/workspace./repo/x", "/workspace/repo"), false)
+        }
+    })
+
+    test("segments without trailing dots/spaces are unchanged", () => {
+        assert.equal(norm("F:/Repo/Sub/File.TXT"), "f:/repo/sub/file.txt")
     })
 })
 

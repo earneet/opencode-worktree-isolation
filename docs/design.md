@@ -321,7 +321,7 @@ for (const d of symlinkDirs || []) {
 
 ### 16.6 已知边界
 
-- `strictGitOps` 正则只识别 `git` 直接开头的命令，`cd x && git merge` 绕过（与 zcode 一致的已知限制）
+- `strictGitOps` 按 shell 段（`;`/`&&`/`|`/换行）分词识别字面 `git` 命令：复合命令（`cd x && git merge`）会被识别；变量间接（`G=git; $G merge`）、引号形式、反斜杠续行、脚本内嵌命令仍可绕过（2026-10-30 审查后由正则改为令牌化分析，原文"仅识别行首 git、复合命令绕过"的描述与实现不符）
 - `git-common` 模式下 `git rev-parse --git-common-dir` 失败时抛清晰错误（指引切换回 external）
 - 审计日志原样记录绝对路径（可能含本地用户名，README 已注明）
 - 子代理继承保留 opencode client API，不读 SQLite DB（与 zcode 不同，opencode 的优势）
