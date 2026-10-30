@@ -1819,6 +1819,155 @@ describe("SessionStart discipline injection (T3.3)", () => {
     })
 })
 
+describe("sub-agent binding inheritance engine (review T1)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "ocwt-inherit-"))
+    const repoDir = path.join(root, "repo")
+    const stateDir = path.join(root, "state")
+    const wtDirRoot = path.join(root, "worktrees")
+    const PARENT = "parent-session"
+    const CHILD = "child-session"
+    const parents = { [CHILD]: PARENT }
+    let prevEnvState
+    let prevEnvRoot
+    let hooks
+
+    before(async () => {
+        prevEnvState = process.env.OC_WT_STATE_DIR
+        prevEnvRoot = process.env.OC_WT_ROOT
+        process.env.OC_WT_STATE_DIR = stateDir
+        process.env.OC_WT_ROOT = wtDirRoot
+
+        mkdirSync(repoDir, { recursive: true })
+        assert.ok(git(["init"], repoDir).ok, "git init for inherit repo")
+        assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
+        assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
+        assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
+        writeFileSync(path.join(repoDir, "README.md"), "# inherit\n")
+        assert.ok(git(["add", "README.md"], repoDir).ok)
+        assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
+
+        const client = {
+            session: {
+                get: async (req) => ({ data: { parentID: parents[req?.path?.id] ?? null } }),
+            },
+        }
+        hooks = await pluginEntry.server({ directory: repoDir, client })
+    })
+
+    after(() => {
+        process.env.OC_WT_STATE_DIR = prevEnvState
+        process.env.OC_WT_ROOT = prevEnvRoot
+        try {
+            rmSync(root, { recursive: true, force: true })
+        } catch {}
+    })
+
+    const tctx = (sid) => ({ directory: repoDir, sessionID: sid, metadata: () => {} })
+    const interceptChild = async () => {
+        const args = { filePath: path.join(repoDir, "file.txt") }
+        await hooks["tool.execute.before"]({ tool: "write", sessionID: CHILD, callID: "c1" }, { args })
+        return args
+    }
+
+    test("child inherits the parent binding on its first tool call and is released on idle", async () => {
+        const prep = await hooks.tool.worktree_prepare.execute({ title: "inherit test" }, tctx(PARENT))
+        assert.ok(prep.startsWith("✅"), `prepare should succeed, got: ${prep}`)
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[PARENT].path
+
+        const args = await interceptChild()
+        assert.equal(
+            args.filePath,
+            path.join(wtPath, "file.txt"),
+            `child write must be rewritten into the inherited worktree, got: ${args.filePath}`,
+        )
+        const childBinding = loadState(pid).sessions[CHILD]
+        assert.ok(childBinding, "inherited child binding must be persisted")
+        assert.equal(childBinding.inherited, true, "child binding must be marked inherited")
+
+        await hooks.event({ event: { type: "session.idle", properties: { sessionID: CHILD } } })
+        assert.ok(!loadState(pid).sessions[CHILD], "idle child binding must be released")
+    })
+
+    test("self-healing: a released child re-inherits on its next tool call", async () => {
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[PARENT].path
+        const args = await interceptChild()
+        assert.equal(
+            args.filePath,
+            path.join(wtPath, "file.txt"),
+            `child must re-inherit after idle release, got: ${args.filePath}`,
+        )
+        assert.ok(loadState(pid).sessions[CHILD]?.inherited, "re-inherited binding must be persisted")
+    })
+})
+
+describe("inheritCache null staleness (review A11)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "ocwt-inherit-null-"))
+    const repoDir = path.join(root, "repo")
+    const stateDir = path.join(root, "state")
+    const wtDirRoot = path.join(root, "worktrees")
+    const PARENT = "parent-session"
+    const CHILD = "child-session"
+    const parents = { [CHILD]: PARENT }
+    let prevEnvState
+    let prevEnvRoot
+    let hooks
+
+    before(async () => {
+        prevEnvState = process.env.OC_WT_STATE_DIR
+        prevEnvRoot = process.env.OC_WT_ROOT
+        process.env.OC_WT_STATE_DIR = stateDir
+        process.env.OC_WT_ROOT = wtDirRoot
+
+        mkdirSync(repoDir, { recursive: true })
+        assert.ok(git(["init"], repoDir).ok, "git init for inherit-null repo")
+        assert.ok(git(["config", "user.email", "test@test.com"], repoDir).ok)
+        assert.ok(git(["config", "user.name", "Test"], repoDir).ok)
+        assert.ok(git(["config", "core.autocrlf", "false"], repoDir).ok)
+        writeFileSync(path.join(repoDir, "README.md"), "# inherit null\n")
+        assert.ok(git(["add", "README.md"], repoDir).ok)
+        assert.ok(git(["commit", "-m", "initial commit"], repoDir).ok)
+
+        const client = {
+            session: {
+                get: async (req) => ({ data: { parentID: parents[req?.path?.id] ?? null } }),
+            },
+        }
+        hooks = await pluginEntry.server({ directory: repoDir, client })
+    })
+
+    after(() => {
+        process.env.OC_WT_STATE_DIR = prevEnvState
+        process.env.OC_WT_ROOT = prevEnvRoot
+        try {
+            rmSync(root, { recursive: true, force: true })
+        } catch {}
+    })
+
+    const tctx = (sid) => ({ directory: repoDir, sessionID: sid, metadata: () => {} })
+
+    test("a tool call made before the parent prepares must not poison inheritance", async () => {
+        const early = { filePath: path.join(repoDir, "file.txt") }
+        await hooks["tool.execute.before"]({ tool: "write", sessionID: CHILD, callID: "c1" }, { args: early })
+        assert.equal(early.filePath, path.join(repoDir, "file.txt"), "no binding yet → path untouched")
+
+        const prep = await hooks.tool.worktree_prepare.execute({ title: "late prepare" }, tctx(PARENT))
+        assert.ok(prep.startsWith("✅"), `late prepare should succeed, got: ${prep}`)
+        const pid = computeProjectId(repoDir)
+        const wtPath = loadState(pid).sessions[PARENT].path
+
+        const after = { filePath: path.join(repoDir, "file.txt") }
+        await hooks["tool.execute.before"]({ tool: "write", sessionID: CHILD, callID: "c2" }, { args: after })
+        assert.equal(
+            after.filePath,
+            path.join(wtPath, "file.txt"),
+            `child must inherit after the late prepare (null cache cleared), got: ${after.filePath}`,
+        )
+        assert.ok(loadState(pid).sessions[CHILD]?.inherited, "late-inherited binding must be persisted")
+    })
+})
+
 after(() => {
     try {
         rmSync(testRoot, { recursive: true, force: true })

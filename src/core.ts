@@ -324,6 +324,10 @@ export function createCore(opts: CoreOptions): WorktreeCore {
             title,
             createdAt: new Date().toISOString(),
         })
+        // Sessions that already resolved their binding (typically sub-agents
+        // started before this prepare) cached a null result; the new worktree
+        // makes that stale, or they would never inherit (review 2026-10-30, A11).
+        inheritCache.clear()
         stateBackend.appendAudit({
             type: "prepare",
             sessionId: call.sessionId,

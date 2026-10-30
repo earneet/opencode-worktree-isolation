@@ -139,13 +139,23 @@ export const v2Plugin: PluginNamespace.Plugin = {
                 // The public event stream is server-wide; V1 hosts filtered by
                 // location before delivery, so keep that behavior here.
                 if (event.location?.directory && event.location.directory !== repoRoot) continue
-                if (event.type === "session.idle") {
-                    core.onSessionIdle(event.data.sessionID)
-                } else if (event.type === "session.deleted") {
-                    core.onSessionDeleted(event.data.sessionID)
+                try {
+                    if (event.type === "session.idle") {
+                        core.onSessionIdle(event.data.sessionID)
+                    } else if (event.type === "session.deleted") {
+                        core.onSessionDeleted(event.data.sessionID)
+                    }
+                } catch (e) {
+                    // One poisoned event (e.g. EBUSY unlink while an antivirus
+                    // scans the binding file) must not kill the subscription:
+                    // the inherited-binding release channel would silently stop
+                    // (review 2026-10-30, A1).
+                    process.stderr.write(`[worktree] event handler failed: ${(e as Error).message}\n`)
                 }
             }
-        })().catch(() => {})
+        })().catch((e) => {
+            process.stderr.write(`[worktree] event subscription died: ${(e as Error).message}\n`)
+        })
 
         return () => controller.abort()
     },
