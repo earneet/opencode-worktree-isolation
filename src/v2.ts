@@ -5,7 +5,7 @@
 import type { Plugin as PluginNamespace } from "@opencode/plugin"
 import { createCore, DESCRIPTIONS, ARG_DESCRIPTIONS } from "./core.js"
 import { injectShellRewriteNotice } from "./lib.js"
-import type { AllowArgs, CleanupArgs, CoreCall, MergeArgs, PrepareArgs } from "./core.js"
+import type { AllowArgs, CleanupArgs, CoreCall, DoctorArgs, MergeArgs, PrepareArgs } from "./core.js"
 
 const PREPARE_INPUT = {
     type: "object",
@@ -48,6 +48,14 @@ const ALLOW_INPUT = {
         ttlMinutes: { type: "number", description: ARG_DESCRIPTIONS.allow.ttlMinutes },
     },
     required: ["action"],
+    additionalProperties: false,
+}
+
+const DOCTOR_INPUT = {
+    type: "object",
+    properties: {
+        auditLines: { type: "number", description: ARG_DESCRIPTIONS.doctor.auditLines },
+    },
     additionalProperties: false,
 }
 
@@ -111,6 +119,14 @@ export const v2Plugin: PluginNamespace.Plugin = {
                 input: ALLOW_INPUT,
                 execute: async (input, context) => ({
                     content: await core.allow(input as AllowArgs, makeCall(context.sessionID)),
+                }),
+            })
+            editor.add({
+                name: "worktree_doctor",
+                description: DESCRIPTIONS.doctor,
+                input: DOCTOR_INPUT,
+                execute: async (input, context) => ({
+                    content: await core.doctor(input as DoctorArgs, makeCall(context.sessionID)),
                 }),
             })
         })

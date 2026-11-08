@@ -121,6 +121,24 @@ worktree_allow(action="clear")
 ```
 Each `add` is audited to `<state-dir>/<projectId>.audit.jsonl` with type `allow_add`. Dangerous paths (`.git`, repo root, `*`) are rejected.
 
+### Health check: worktree_doctor
+
+If the plugin misbehaves — or you suspect it silently failed to load (opencode currently logs nothing when a plugin fails) — run:
+
+```
+worktree_doctor()
+worktree_doctor(auditLines=20)
+```
+
+It prints a strictly **read-only** health report: plugin version/build fingerprint, readiness (git availability, state backend write-read probe, host API shape), config warnings, bound worktrees with merge/dirty/presence status, allowlist stats, recent audit entries, and a self-check that asks the host which tools are actually registered.
+
+On load, the plugin also emits a heartbeat (`[worktree] loaded <name>@<version> ... tools=5 state=...`) to the process console and an audited `plugin_loaded` entry. Readiness failures never throw: the plugin degrades loudly instead — every session gets a system-prompt warning and `worktree_doctor` shows the failure details, because a host that swallows load errors would turn a throw into total silent disappearance.
+
+## Troubleshooting
+
+- **Tools missing after install?** opencode does not report plugin install/load failures. Run `worktree_doctor` if the plugin loads at all; if nothing loads, check that the plugin entry's target file exists (git-URL installs through opencode's embedded Bun skip `prepare` scripts, so packages that build at install time ship without `dist/` — see [docs/upstream-issue-opencode-silent-plugin-failure.md](docs/upstream-issue-opencode-silent-plugin-failure.md)).
+- **Config changes have no effect?** opencode loads config once at startup. Restart the app (desktop app instances started before an edit keep the old plugin set).
+
 ## Configuration
 
 Optional sidecar config at `.opencode/worktree-workflow.json` in your repo root:

@@ -201,10 +201,10 @@ for (const [label, makeHarness] of harnessMakers) {
             await h.init()
         })
 
-        test(`loads and exposes the four worktree tools (${label})`, () => {
+        test(`loads and exposes the five worktree tools (${label})`, () => {
             assert.deepEqual(
                 [...h.toolNames].sort(),
-                ["worktree_allow", "worktree_cleanup", "worktree_merge", "worktree_prepare"],
+                ["worktree_allow", "worktree_cleanup", "worktree_doctor", "worktree_merge", "worktree_prepare"],
             )
         })
 

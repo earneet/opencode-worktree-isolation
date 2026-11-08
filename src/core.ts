@@ -6,7 +6,7 @@ import {
     computeProjectId,
     validateBranch,
     slugify,
-    loadConfig,
+    loadConfigReported,
     createStateBackend,
     resolveWorktreeRoot,
     defaultBaseBranch,
@@ -26,8 +26,24 @@ import {
     findSessionsForWorktree,
     mergedBranchSet,
     shellRewriteNotice,
+    runReadinessChecks,
+    probeStateBackend,
+    pluginVersion,
+    pluginBuildDate,
+    tailAuditLines,
+    buildDoctorReport,
+    ExternalStateBackend,
 } from "./lib.js"
-import type { DecisionContext, MutableToolArgs, SessionBinding, SnapshotResult, WorktreeState } from "./lib.js"
+import type {
+    DecisionContext,
+    DoctorBindingRow,
+    DoctorHostTools,
+    MutableToolArgs,
+    SessionBinding,
+    SnapshotResult,
+    StateBackend,
+    WorktreeState,
+} from "./lib.js"
 
 export const DESCRIPTIONS = {
     prepare:
@@ -50,6 +66,11 @@ export const DESCRIPTIONS = {
         "Temporarily allow writing to specific paths in the main checkout without a worktree binding. " +
         "Use for repo-level config/docs (e.g., AGENTS.md, CI configs). Entries have a TTL and are audited. " +
         "Requires strictWrites=true to be meaningful (otherwise all writes are allowed by default).",
+    doctor:
+        "Health report for the opencode-worktree-isolation plugin: version/build info, readiness and degraded " +
+        "state, config warnings, git availability, state backend, bound worktrees (merge/dirty/presence), " +
+        "allowlist, host tool registration, and the recent audit trail. Strictly read-only — it never " +
+        "creates, reaps, or modifies anything.",
 } as const
 
 export const ARG_DESCRIPTIONS = {
@@ -72,6 +93,9 @@ export const ARG_DESCRIPTIONS = {
         path: "For add: repo-relative path or glob pattern",
         reason: "For add: why this path needs main-checkout write",
         ttlMinutes: "TTL in minutes (default: 60, configurable via allowlistTtlMinutes)",
+    },
+    doctor: {
+        auditLines: "How many recent audit log lines to include (default 10)",
     },
 } as const
 
@@ -99,6 +123,20 @@ export interface AllowArgs {
     ttlMinutes?: number
 }
 
+export interface DoctorArgs {
+    auditLines?: number
+}
+
+// The tool set this plugin registers, in registration order. Used by the load
+// heartbeat and by worktree_doctor's host-tool self-check.
+export const WORKTREE_TOOLS = [
+    "worktree_prepare",
+    "worktree_cleanup",
+    "worktree_merge",
+    "worktree_allow",
+    "worktree_doctor",
+] as const
+
 // Per-call context handed to the shared tool bodies. V1 fills `directory` from
 // each tool invocation's context; V2 has no per-call directory and falls back
 // to the location captured at plugin setup.
@@ -113,6 +151,15 @@ export interface CoreOptions {
     // Must normalize lookup failures to undefined so parent-chain traversal
     // stops exactly like V1's `catch { break }` did.
     getParentId: (sessionId: string) => Promise<string | undefined>
+    // Degradation the adapter observed itself at load time (e.g. a host
+    // client API shape check). Folded into the core degraded list before the
+    // load heartbeat is written.
+    initDegraded?: string[]
+    // Asks the host which tools are actually registered — the only reliable
+    // probe for "hooks registered but silently not wired". Optional: hosts
+    // without a tool-enumeration API leave it unset and worktree_doctor
+    // reports the check as unavailable.
+    hostToolProbe?: () => Promise<DoctorHostTools>
 }
 
 export interface WorktreeCore {
@@ -120,6 +167,7 @@ export interface WorktreeCore {
     cleanup(args: CleanupArgs, call: CoreCall): Promise<string>
     merge(args: MergeArgs, call: CoreCall): Promise<string>
     allow(args: AllowArgs, call: CoreCall): Promise<string>
+    doctor(args: DoctorArgs, call: CoreCall): Promise<string>
     intercept(toolName: unknown, sessionId: unknown, args: unknown, callID?: unknown): Promise<void>
     // Pops the rewrite notice recorded for a tool call. The execute.after hook
     // uses this to prepend the notice to the tool output, making shell text
@@ -134,8 +182,55 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     const repoRoot = opts.repoRoot
     const getParentId = opts.getParentId
 
-    const cfg = loadConfig(repoRoot)
-    const stateBackend = createStateBackend(repoRoot, cfg)
+    // Readiness checks degrade loudly instead of throwing: a host that swallows
+    // plugin load errors (observed with opencode) would turn a throw into total
+    // silent disappearance — strictly worse than a loaded plugin that reports
+    // its problems through worktree_doctor, the audit log, and the system prompt.
+    const degraded: string[] = [...(opts.initDegraded ?? [])]
+    const { config: cfg, warnings: configWarnings } = loadConfigReported(repoRoot)
+    degraded.push(...configWarnings)
+
+    let stateBackend: StateBackend
+    try {
+        stateBackend = createStateBackend(repoRoot, cfg)
+    } catch (e) {
+        degraded.push(
+            `state backend "${cfg.stateLocation}" init failed: ${(e as Error).message}; fell back to external state`,
+        )
+        stateBackend = new ExternalStateBackend(repoRoot)
+    }
+
+    const readiness = runReadinessChecks(repoRoot)
+    const gitVersion = readiness.gitVersion
+    degraded.push(...readiness.failures)
+
+    const version = pluginVersion()
+    const builtAt = pluginBuildDate()
+    const loadedAt = new Date().toISOString()
+    // The probe doubles as the durable heartbeat: an audit entry written and
+    // read back through the real backend paths.
+    const heartbeat = probeStateBackend(stateBackend, {
+        version,
+        built: builtAt,
+        tools: WORKTREE_TOOLS.length,
+        state: cfg.stateLocation,
+        ...(degraded.length ? { degraded: degraded.slice() } : {}),
+    })
+    if (!heartbeat.ok) {
+        degraded.push(`state backend write-read probe failed: ${heartbeat.error ?? "unknown error"}`)
+    }
+
+    // Console output passes through to the host process stdout/stderr (visible
+    // in headless/CI runs; the host does NOT capture it into its own log).
+    console.log(
+        `[worktree] loaded ${version} built=${builtAt ?? "?"} tools=${WORKTREE_TOOLS.length} state=${cfg.stateLocation}` +
+            (degraded.length ? ` DEGRADED(${degraded.length}) — run worktree_doctor` : ""),
+    )
+
+    const requireGit = (): string | null =>
+        gitVersion
+            ? null
+            : `❌ git is unavailable — worktree tools cannot run. Run worktree_doctor for a health report.`
 
     const inheritCache = new Map<string, (SessionBinding & { _state?: WorktreeState }) | null>()
 
@@ -267,6 +362,8 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     }
 
     async function prepare(args: PrepareArgs, call: CoreCall): Promise<string> {
+        const gitErr = requireGit()
+        if (gitErr) return gitErr
         const R = call.directory
         const pid = computeProjectId(R)
         const title = (args.title || "").trim()
@@ -345,6 +442,8 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     }
 
     async function cleanup(args: CleanupArgs, call: CoreCall): Promise<string> {
+        const gitErr = requireGit()
+        if (gitErr) return gitErr
         const R = call.directory
         const base = cfg.baseBranch || defaultBaseBranch(R)
         if (args.action === "preview") {
@@ -494,6 +593,8 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     }
 
     async function merge(args: MergeArgs, call: CoreCall): Promise<string> {
+        const gitErr = requireGit()
+        if (gitErr) return gitErr
         const R = call.directory
         const state = stateBackend.loadAll()
 
@@ -750,6 +851,103 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         )
     }
 
+    async function doctor(args: DoctorArgs, call: CoreCall): Promise<string> {
+        // Host self-check: ask the host which tools are actually registered.
+        // This is the only reliable probe for "hooks registered but silently
+        // not wired" — a load-time check cannot see it.
+        let hostTools: DoctorHostTools = {
+            status: "unavailable",
+            missing: [],
+            detail: "this host generation cannot enumerate registered tools",
+        }
+        if (opts.hostToolProbe) {
+            try {
+                hostTools = await opts.hostToolProbe()
+            } catch (e) {
+                hostTools = { status: "unavailable", missing: [], detail: (e as Error).message }
+            }
+        }
+
+        // Aggregate bindings per worktree path (read-only; no reaping even
+        // for missing directories — unlike cleanup preview).
+        const state = stateBackend.loadAll()
+        const byPath = new Map<
+            string,
+            { branch: string; path: string; title: string; sessions: number; inherited: number }
+        >()
+        for (const [, b] of Object.entries(state.sessions)) {
+            const key = norm(b.path)
+            const entry = byPath.get(key)
+            if (!entry) {
+                byPath.set(key, {
+                    branch: b.branch,
+                    path: b.path,
+                    title: b.title,
+                    sessions: 1,
+                    inherited: b.inherited ? 1 : 0,
+                })
+            } else {
+                entry.sessions += 1
+                if (b.inherited) entry.inherited += 1
+                else {
+                    entry.branch = b.branch
+                    entry.title = b.title
+                }
+            }
+        }
+        const mergedSet = gitVersion
+            ? mergedBranchSet(call.directory, cfg.baseBranch || defaultBaseBranch(call.directory))
+            : undefined
+        const now = Date.now()
+        const bindings: DoctorBindingRow[] = [...byPath.values()].map((e) => {
+            const present = existsSync(e.path)
+            const dirtyRes = gitVersion && present ? git(["status", "--porcelain"], e.path) : null
+            return {
+                branch: e.branch,
+                path: e.path,
+                present,
+                sessions: e.sessions,
+                inherited: e.inherited,
+                merged: mergedSet == null ? null : mergedSet.has(e.branch),
+                dirty: dirtyRes ? (dirtyRes.ok ? dirtyRes.stdout.trim() !== "" : null) : null,
+                isProtected: cfg.protectedBranches.includes(e.branch),
+                title: e.title,
+            }
+        })
+
+        // readAllowlist (not loadAllowlist): the latter garbage-collects
+        // expired entries with a write — doctor must stay read-only.
+        const allowEntries = stateBackend.readAllowlist()
+        const allowlist = {
+            active: allowEntries.filter((e) => !e.expiresAt || new Date(e.expiresAt).getTime() >= now)
+                .length,
+            expired: allowEntries.filter((e) => e.expiresAt && new Date(e.expiresAt).getTime() < now)
+                .length,
+        }
+
+        const report = buildDoctorReport({
+            version,
+            builtAt,
+            loadedAt,
+            degraded,
+            configWarnings,
+            gitVersion,
+            stateMode: cfg.stateLocation,
+            auditLogPath: stateBackend.auditLogPath(),
+            bindings,
+            allowlist,
+            hostTools,
+            auditTail: tailAuditLines(stateBackend.auditLogPath(), args.auditLines ?? 10),
+        })
+        if (hostTools.status === "missing") {
+            return (
+                `⚠ Host reports these tools as NOT registered: ${hostTools.missing.join(", ")}\n` +
+                `The plugin may have partially failed to load, or the host is filtering them.\n\n` + report
+            )
+        }
+        return report
+    }
+
     async function intercept(toolName: unknown, sessionId: unknown, args: unknown, callID?: unknown): Promise<void> {
         if (typeof toolName !== "string" || typeof sessionId !== "string" || !sessionId) return
         if (toolName.startsWith("worktree_")) return
@@ -811,10 +1009,11 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     }
 
     async function systemPromptText(sessionId: string | undefined | null): Promise<string | null> {
-        if (!sessionId) return null
-        const binding = await resolveBinding(sessionId)
+        let binding: (SessionBinding & { _state?: WorktreeState }) | null = null
+        if (sessionId) binding = await resolveBinding(sessionId)
+        let text: string | null = null
         if (binding) {
-            return (
+            text =
                 `## ACTIVE WORKTREE — Your Working Directory Has Changed\n` +
                 `Your working directory is now the git worktree:\n` +
                 `  ${binding.path}\n` +
@@ -826,21 +1025,27 @@ export function createCore(opts: CoreOptions): WorktreeCore {
                 `  WRONG:   filePath starting with "${binding.repoRoot}"\n\n` +
                 `For bash, your working directory is already the worktree.\n` +
                 `For glob/grep, use the worktree path as the search root.`
-            )
-        }
-        if (cfg.strictWrites || cfg.strictGitOps || cfg.sessionStartNudge) {
+        } else if (sessionId && (cfg.strictWrites || cfg.strictGitOps || cfg.sessionStartNudge)) {
             const protectedList =
                 cfg.protectedBranches.length > 0 ? cfg.protectedBranches.join(", ") : "master, main"
-            return (
+            text =
                 `## WORKTREE-GUARD ACTIVE\n` +
                 `This repo enforces worktree discipline (strictWrites=${cfg.strictWrites}, strictGitOps=${cfg.strictGitOps}).\n` +
                 `- Before writing code, call worktree_prepare to create an isolated worktree.\n` +
                 `- Writes to the main checkout without a binding will be BLOCKED (if strictWrites=true).\n` +
                 `- Dangerous git operations on protected branches (${protectedList}) will be BLOCKED (if strictGitOps=true).\n` +
                 `- For repo-level config/docs, use worktree_allow or add paths to mainWriteWhitelist.\n`
-            )
         }
-        return null
+        if (degraded.length > 0) {
+            const banner =
+                `## ⚠ WORKTREE PLUGIN DEGRADED\n` +
+                `The opencode-worktree-isolation plugin loaded but reported ${degraded.length} problem(s):\n` +
+                degraded.map((d) => `- ${d}`).join("\n") +
+                `\nTell the user about this and suggest running worktree_doctor for a full health report. ` +
+                `Worktree isolation may be partially or fully inactive until fixed.`
+            text = text ? `${banner}\n\n${text}` : banner
+        }
+        return text
     }
 
     function onSessionIdle(sessionId: string): void {
@@ -865,6 +1070,7 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         cleanup,
         merge,
         allow,
+        doctor,
         intercept,
         takeShellRewriteNotice,
         systemPromptText,

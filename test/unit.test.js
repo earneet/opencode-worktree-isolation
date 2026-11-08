@@ -35,6 +35,13 @@ import {
     SCHEMA_VERSION,
     ensureMeta,
     removeSyncedLinks,
+    loadConfigReported,
+    runReadinessChecks,
+    probeStateBackend,
+    pluginVersion,
+    pluginBuildDate,
+    tailAuditLines,
+    buildDoctorReport,
 } from "../dist/lib.js"
 
 // Build fixtures from a resolved absolute path so they are native on every OS
@@ -1774,3 +1781,325 @@ test("lib: every spawnSync call site passes windowsHide: true (issue #12)", () =
         assert.match(call, /windowsHide:\s*true/, `missing windowsHide: true in spawnSync call`)
     }
 })
+
+describe("readiness + doctor (layer 2/3)", () => {
+    const mkRepo = () => mkdtempSync(path.join(tmpdir(), "ocready-"))
+
+    describe("loadConfigReported", () => {
+        test("returns defaults with no warnings when no config file exists", () => {
+            const repo = mkRepo()
+            try {
+                const { config, warnings } = loadConfigReported(repo)
+                assert.equal(config.branchPrefix, "wt/")
+                assert.equal(config.strictWrites, false)
+                assert.deepEqual(warnings, [])
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+
+        test("applies a valid config with no warnings", () => {
+            const repo = mkRepo()
+            try {
+                mkdirSync(path.join(repo, ".opencode"), { recursive: true })
+                writeFileSync(
+                    path.join(repo, ".opencode", "worktree-workflow.json"),
+                    JSON.stringify({ strictWrites: true, protectedBranches: ["main"], allowlistTtlMinutes: 30 }),
+                )
+                const { config, warnings } = loadConfigReported(repo)
+                assert.equal(config.strictWrites, true)
+                assert.deepEqual(config.protectedBranches, ["main"])
+                assert.equal(config.allowlistTtlMinutes, 30)
+                assert.deepEqual(warnings, [])
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+
+        test("reports broken JSON instead of silently falling back", () => {
+            const repo = mkRepo()
+            try {
+                mkdirSync(path.join(repo, ".opencode"), { recursive: true })
+                writeFileSync(path.join(repo, ".opencode", "worktree-workflow.json"), "{ not json")
+                const { config, warnings } = loadConfigReported(repo)
+                assert.equal(config.strictWrites, false, "defaults must apply")
+                assert.equal(warnings.length, 1)
+                assert.match(warnings[0], /failed to parse/)
+                assert.match(warnings[0], /NOT applied/)
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+
+        test("reports wrong-typed fields and keeps defaults", () => {
+            const repo = mkRepo()
+            try {
+                mkdirSync(path.join(repo, ".opencode"), { recursive: true })
+                writeFileSync(
+                    path.join(repo, ".opencode", "worktree-workflow.json"),
+                    JSON.stringify({
+                        strictWrites: "yes",
+                        protectedBranches: "main",
+                        branchPrefix: 42,
+                        sync: { copyFiles: ["ok", 7] },
+                        stateLocation: "weird",
+                    }),
+                )
+                const { config, warnings } = loadConfigReported(repo)
+                assert.equal(config.strictWrites, false)
+                assert.deepEqual(config.protectedBranches, [])
+                assert.equal(config.branchPrefix, "wt/")
+                assert.deepEqual(config.sync.copyFiles, [])
+                assert.equal(config.stateLocation, "external")
+                assert.ok(warnings.some((w) => w.includes('"strictWrites"')))
+                assert.ok(warnings.some((w) => w.includes('"protectedBranches"')))
+                assert.ok(warnings.some((w) => w.includes('"branchPrefix"')))
+                assert.ok(warnings.some((w) => w.includes('"copyFiles"')))
+                assert.ok(warnings.some((w) => w.includes('"stateLocation"')))
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+
+        test("treats explicit nulls as unset without warning (legacy semantics)", () => {
+            const repo = mkRepo()
+            try {
+                mkdirSync(path.join(repo, ".opencode"), { recursive: true })
+                writeFileSync(
+                    path.join(repo, ".opencode", "worktree-workflow.json"),
+                    JSON.stringify({ baseBranch: null, worktreeRoot: null }),
+                )
+                const { config, warnings } = loadConfigReported(repo)
+                assert.equal(config.baseBranch, null)
+                assert.equal(config.worktreeRoot, null)
+                assert.deepEqual(warnings, [])
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+
+        test("still warns about dangerous mainWriteWhitelist patterns", () => {
+            const repo = mkRepo()
+            try {
+                mkdirSync(path.join(repo, ".opencode"), { recursive: true })
+                writeFileSync(
+                    path.join(repo, ".opencode", "worktree-workflow.json"),
+                    JSON.stringify({ mainWriteWhitelist: ["AGENTS.md", "*"] }),
+                )
+                const { config, warnings } = loadConfigReported(repo)
+                assert.deepEqual(config.mainWriteWhitelist, ["AGENTS.md"])
+                assert.ok(warnings.some((w) => w.includes("dangerous")))
+            } finally {
+                try { rmSync(repo, { recursive: true, force: true }) } catch {}
+            }
+        })
+    })
+
+    describe("runReadinessChecks", () => {
+        const okGit = () => ({ ok: true, stdout: "git version 2.99.1\n", stderr: "" })
+        const badGit = () => ({ ok: false, stdout: "", stderr: "'git' is not recognized\n" })
+
+        test("passes when git answers --version", () => {
+            const r = runReadinessChecks("/anywhere", okGit)
+            assert.deepEqual(r.failures, [])
+            assert.match(r.gitVersion, /git version/)
+        })
+
+        test("fails with a reason when git is unavailable", () => {
+            const r = runReadinessChecks("/anywhere", badGit)
+            assert.equal(r.gitVersion, null)
+            assert.equal(r.failures.length, 1)
+            assert.match(r.failures[0], /git is not available/)
+        })
+
+        test("fails when git prints nothing usable", () => {
+            const r = runReadinessChecks("/anywhere", () => ({ ok: true, stdout: "", stderr: "" }))
+            assert.equal(r.gitVersion, null)
+            assert.equal(r.failures.length, 1)
+        })
+    })
+
+    describe("probeStateBackend", () => {
+        let stateDir
+        let prevEnv
+
+        before(() => {
+            stateDir = mkdtempSync(path.join(tmpdir(), "ocready-state-"))
+            prevEnv = process.env.OC_WT_STATE_DIR
+            process.env.OC_WT_STATE_DIR = stateDir
+        })
+
+        after(() => {
+            if (prevEnv === undefined) delete process.env.OC_WT_STATE_DIR
+            else process.env.OC_WT_STATE_DIR = prevEnv
+            try { rmSync(stateDir, { recursive: true, force: true }) } catch {}
+        })
+
+        test("write-read round-trip succeeds and leaves a plugin_loaded audit heartbeat", () => {
+            const backend = new ExternalStateBackend(path.resolve("/tmp/ocready/repo"))
+            const r = probeStateBackend(backend, { version: "test@1.2.3", state: "external" })
+            assert.equal(r.ok, true)
+            assert.equal(r.error, undefined)
+            const auditPath = backend.auditLogPath()
+            assert.ok(auditPath && existsSync(auditPath), "audit heartbeat file must exist")
+            const lines = readFileSync(auditPath, "utf8").trim().split("\n")
+            const entry = JSON.parse(lines[lines.length - 1])
+            assert.equal(entry.type, "plugin_loaded")
+            assert.equal(entry.version, "test@1.2.3")
+        })
+
+        test("reports failure when the backend cannot write", () => {
+            const broken = {
+                appendAudit() { throw new Error("disk full") },
+                listBindings() { return [] },
+            }
+            const r = probeStateBackend(broken, {})
+            assert.equal(r.ok, false)
+            assert.match(r.error, /disk full/)
+        })
+    })
+
+    test("pluginVersion reads the real package.json", () => {
+        assert.match(pluginVersion(), /^opencode-worktree-isolation@\d+\.\d+\.\d+$/)
+    })
+
+    test("pluginBuildDate returns an ISO timestamp of the built module", () => {
+        const d = pluginBuildDate()
+        assert.ok(d === null || !Number.isNaN(Date.parse(d)), "must be ISO-parsable or null")
+    })
+
+    test("tailAuditLines tails the last N lines read-only", () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "ocready-audit-"))
+        try {
+            const f = path.join(dir, "x.audit.jsonl")
+            writeFileSync(f, Array.from({ length: 25 }, (_, i) => `{"n":${i}}`).join("\n") + "\n")
+            assert.deepEqual(tailAuditLines(null, 10), [])
+            assert.deepEqual(tailAuditLines(f, 0), [])
+            const tail = tailAuditLines(f, 3)
+            assert.deepEqual(tail, [`{"n":22}`, `{"n":23}`, `{"n":24}`])
+            assert.deepEqual(tailAuditLines(path.join(dir, "missing.jsonl"), 5), [])
+        } finally {
+            try { rmSync(dir, { recursive: true, force: true }) } catch {}
+        }
+    })
+
+    test("readAllowlist is strictly read-only while loadAllowlist garbage-collects", () => {
+        const stateDir = mkdtempSync(path.join(tmpdir(), "ocready-allow-"))
+        const prevEnv = process.env.OC_WT_STATE_DIR
+        process.env.OC_WT_STATE_DIR = stateDir
+        try {
+            const backend = new ExternalStateBackend(path.resolve("/tmp/ocready/repo"))
+            const expired = new Date(Date.now() - 60000).toISOString()
+            backend.saveAllowlist([
+                { path: "a.txt", reason: "", createdAt: "", expiresAt: expired },
+                { path: "b.txt", reason: "", createdAt: "" },
+            ])
+            // readAllowlist must not persist a pruned file (doctor contract)
+            const raw = backend.readAllowlist()
+            assert.equal(raw.length, 2, "expired entry must still be visible to the read-only view")
+            const after = JSON.parse(readFileSync(backend.auditLogPath().replace(/audit\.jsonl$/, "allowlist.json"), "utf8"))
+            assert.equal(after.paths.length, 2, "file on disk must be untouched by readAllowlist")
+            // loadAllowlist (production path) does gc
+            const gc = backend.loadAllowlist()
+            assert.equal(gc.length, 1)
+        } finally {
+            if (prevEnv === undefined) delete process.env.OC_WT_STATE_DIR
+            else process.env.OC_WT_STATE_DIR = prevEnv
+            try { rmSync(stateDir, { recursive: true, force: true }) } catch {}
+        }
+    })
+
+    describe("buildDoctorReport", () => {
+        const baseInput = {
+            version: "opencode-worktree-isolation@0.4.3",
+            builtAt: "2026-09-18T13:00:00.000Z",
+            loadedAt: "2026-09-18T14:00:00.000Z",
+            degraded: [],
+            configWarnings: [],
+            gitVersion: "git version 2.99.1",
+            stateMode: "external",
+            auditLogPath: "C:\\state\\x.audit.jsonl",
+            bindings: [
+                {
+                    branch: "wt/feat-a",
+                    path: "C:\\wt\\feat-a",
+                    present: true,
+                    sessions: 2,
+                    inherited: 1,
+                    merged: false,
+                    dirty: true,
+                    isProtected: false,
+                    title: "task a",
+                },
+                {
+                    branch: "wt/gone",
+                    path: "C:\\wt\\gone",
+                    present: false,
+                    sessions: 1,
+                    inherited: 0,
+                    merged: null,
+                    dirty: null,
+                    isProtected: true,
+                    title: "",
+                },
+            ],
+            allowlist: { active: 1, expired: 2 },
+            hostTools: { status: "ok", missing: [] },
+            auditTail: [`{"type":"plugin_loaded","ts":"2026-09-18T14:00:00.000Z"}`],
+        }
+
+        test("healthy report renders the heartbeat fingerprint", () => {
+            const r = buildDoctorReport(baseInput)
+            assert.match(r, /worktree-doctor report/)
+            assert.match(r, /opencode-worktree-isolation@0\.4\.3/)
+            assert.match(r, /built:\s+2026-09-18T13:00:00\.000Z/)
+            assert.match(r, /readiness:\s+✅ all checks passed/)
+            assert.match(r, /host tools:\s+✅/)
+        })
+
+        test("degraded report lists every failure", () => {
+            const r = buildDoctorReport({
+                ...baseInput,
+                degraded: ["git is not available: nope", "state backend write-read probe failed: EACCES"],
+                gitVersion: null,
+                configWarnings: ["config field \"strictWrites\" must be a boolean (got string); keeping default"],
+            })
+            assert.match(r, /DEGRADED \(2\)/)
+            assert.match(r, /git is not available: nope/)
+            assert.match(r, /write-read probe failed/)
+            assert.match(r, /git:\s+UNAVAILABLE/)
+            assert.match(r, /1 warning/)
+        })
+
+        test("binding rows show merge/dirty/presence and missing paths", () => {
+            const r = buildDoctorReport(baseInput)
+            assert.match(r, /wt\/feat-a\s+unmerged\s+dirty\s+present\s+sessions=2 \(inherited=1\)/)
+            assert.match(r, /wt\/gone\s+unknown\s+unknown\s+MISSING\s+sessions=1/)
+            assert.match(r, /🔒protected/)
+            assert.match(r, /path: C:\\wt\\gone/)
+        })
+
+        test("missing host tools are reported explicitly", () => {
+            const r = buildDoctorReport({
+                ...baseInput,
+                hostTools: { status: "missing", missing: ["worktree_prepare", "worktree_doctor"] },
+            })
+            assert.match(r, /NOT registered with the host: worktree_prepare, worktree_doctor/)
+        })
+
+        test("unavailable host tool query degrades gracefully", () => {
+            const r = buildDoctorReport({
+                ...baseInput,
+                hostTools: { status: "unavailable", missing: [], detail: "fetch failed" },
+            })
+            assert.match(r, /host tools:\s+\(unavailable: fetch failed\)/)
+        })
+
+        test("empty bindings and empty audit render placeholders", () => {
+            const r = buildDoctorReport({ ...baseInput, bindings: [], auditTail: [] })
+            assert.match(r, /bindings:\s+\(none/)
+            assert.ok(!r.includes("recent audit"), "audit section must be omitted when empty")
+        })
+    })
+})
+

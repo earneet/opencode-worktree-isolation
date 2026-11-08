@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
+import { createRequire } from "node:module"
+import { fileURLToPath } from "node:url"
 import {
     existsSync,
     mkdirSync,
@@ -345,7 +347,53 @@ export function slugify(title: string): string {
     )
 }
 
-export function loadConfig(repoRoot: string): WorktreeConfig {
+export interface ConfigReport {
+    config: WorktreeConfig
+    warnings: string[]
+}
+
+function typedString(source: Record<string, unknown>, field: string, warnings: string[]): string | null {
+    const v = source[field]
+    if (v === undefined || v === null) return null
+    if (typeof v !== "string") {
+        warnings.push(`config field "${field}" must be a string (got ${typeof v}); keeping default`)
+        return null
+    }
+    return v
+}
+
+function typedBool(source: Record<string, unknown>, field: string, warnings: string[]): boolean | null {
+    const v = source[field]
+    if (v === undefined || v === null) return null
+    if (typeof v !== "boolean") {
+        warnings.push(`config field "${field}" must be a boolean (got ${typeof v}); keeping default`)
+        return null
+    }
+    return v
+}
+
+function typedNumber(source: Record<string, unknown>, field: string, warnings: string[]): number | null {
+    const v = source[field]
+    if (v === undefined || v === null) return null
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+        warnings.push(`config field "${field}" must be a finite number (got ${String(v)}); keeping default`)
+        return null
+    }
+    return v
+}
+
+function typedStringArray(source: Record<string, unknown>, field: string, warnings: string[]): string[] | null {
+    const v = source[field]
+    if (v === undefined || v === null) return null
+    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
+        warnings.push(`config field "${field}" must be an array of strings; keeping default`)
+        return null
+    }
+    return v
+}
+
+export function loadConfigReported(repoRoot: string): ConfigReport {
+    const warnings: string[] = []
     const cfg: WorktreeConfig = {
         branchPrefix: "wt/",
         baseBranch: null,
@@ -361,34 +409,55 @@ export function loadConfig(repoRoot: string): WorktreeConfig {
         sessionStartNudge: false,
     }
     const p = path.join(repoRoot, ".opencode", "worktree-workflow.json")
-    if (!existsSync(p)) return cfg
+    if (!existsSync(p)) return { config: cfg, warnings }
+    let parsed: Record<string, unknown>
     try {
-        const parsed = JSON.parse(readFileSync(p, "utf8")) as Partial<WorktreeConfig>
-        const rawWhitelist = Array.isArray(parsed.mainWriteWhitelist) ? parsed.mainWriteWhitelist : []
-        const { valid, dangerous } = validateWhitelist(rawWhitelist)
-        if (dangerous.length > 0) {
-            process.stderr.write(
-                `[worktree] WARNING: dropping dangerous mainWriteWhitelist patterns (would disable protection): ${dangerous.join(", ")}\n`,
-            )
-        }
-        const merged: WorktreeConfig = {
-            branchPrefix: parsed.branchPrefix ?? cfg.branchPrefix,
-            baseBranch: parsed.baseBranch !== undefined ? parsed.baseBranch : cfg.baseBranch,
-            worktreeRoot: parsed.worktreeRoot !== undefined ? parsed.worktreeRoot : cfg.worktreeRoot,
-            protectedBranches: parsed.protectedBranches ?? cfg.protectedBranches,
-            sync: { copyFiles: parsed.sync?.copyFiles ?? cfg.sync.copyFiles, symlinkDirs: parsed.sync?.symlinkDirs ?? cfg.sync.symlinkDirs },
-            hooks: { postCreate: parsed.hooks?.postCreate ?? cfg.hooks.postCreate, preDelete: parsed.hooks?.preDelete ?? cfg.hooks.preDelete },
-            stateLocation: parsed.stateLocation ?? cfg.stateLocation,
-            strictWrites: parsed.strictWrites ?? cfg.strictWrites,
-            strictGitOps: parsed.strictGitOps ?? cfg.strictGitOps,
-            mainWriteWhitelist: valid,
-            allowlistTtlMinutes: parsed.allowlistTtlMinutes ?? cfg.allowlistTtlMinutes,
-            sessionStartNudge: parsed.sessionStartNudge ?? cfg.sessionStartNudge,
-        }
-        return merged
-    } catch {
-        return cfg
+        parsed = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>
+    } catch (e) {
+        warnings.push(
+            `failed to parse ${p} (${(e as Error).message}); using defaults — ` +
+                `protection settings in that file are NOT applied`,
+        )
+        return { config: cfg, warnings }
     }
+    const sync = (parsed.sync ?? {}) as Record<string, unknown>
+    const hooks = (parsed.hooks ?? {}) as Record<string, unknown>
+    const stateLocation = typedString(parsed, "stateLocation", warnings)
+    const merged: WorktreeConfig = {
+        branchPrefix: typedString(parsed, "branchPrefix", warnings) ?? cfg.branchPrefix,
+        baseBranch: typedString(parsed, "baseBranch", warnings),
+        worktreeRoot: typedString(parsed, "worktreeRoot", warnings),
+        protectedBranches: typedStringArray(parsed, "protectedBranches", warnings) ?? cfg.protectedBranches,
+        sync: {
+            copyFiles: typedStringArray(sync, "copyFiles", warnings) ?? cfg.sync.copyFiles,
+            symlinkDirs: typedStringArray(sync, "symlinkDirs", warnings) ?? cfg.sync.symlinkDirs,
+        },
+        hooks: {
+            postCreate: typedStringArray(hooks, "postCreate", warnings) ?? cfg.hooks.postCreate,
+            preDelete: typedStringArray(hooks, "preDelete", warnings) ?? cfg.hooks.preDelete,
+        },
+        stateLocation: stateLocation === "git-common" ? "git-common" : "external",
+        strictWrites: typedBool(parsed, "strictWrites", warnings) ?? cfg.strictWrites,
+        strictGitOps: typedBool(parsed, "strictGitOps", warnings) ?? cfg.strictGitOps,
+        mainWriteWhitelist: [],
+        allowlistTtlMinutes: typedNumber(parsed, "allowlistTtlMinutes", warnings) ?? cfg.allowlistTtlMinutes,
+        sessionStartNudge: typedBool(parsed, "sessionStartNudge", warnings) ?? cfg.sessionStartNudge,
+    }
+    if (stateLocation !== null && stateLocation !== "external" && stateLocation !== "git-common") {
+        warnings.push(`config field "stateLocation" must be "external" or "git-common" (got "${stateLocation}"); using "external"`)
+    }
+    const rawWhitelist = typedStringArray(parsed, "mainWriteWhitelist", warnings) ?? []
+    const { valid, dangerous } = validateWhitelist(rawWhitelist)
+    if (dangerous.length > 0) {
+        warnings.push(`dropping dangerous mainWriteWhitelist patterns (would disable protection): ${dangerous.join(", ")}`)
+        process.stderr.write(`[worktree] WARNING: ${warnings[warnings.length - 1]}\n`)
+    }
+    merged.mainWriteWhitelist = valid
+    return { config: merged, warnings }
+}
+
+export function loadConfig(repoRoot: string): WorktreeConfig {
+    return loadConfigReported(repoRoot).config
 }
 
 export function resolveWorktreeRoot(raw: string | null | undefined, repoRoot: string): string {
@@ -961,6 +1030,18 @@ export interface StateBackend {
     loadAllowlist(): AllowlistEntry[]
     saveAllowlist(entries: AllowlistEntry[]): void
     appendAudit(entry: Record<string, unknown>): void
+    readAllowlist(): AllowlistEntry[]
+    auditLogPath(): string | null
+}
+
+function parseAllowlistFile(f: string): AllowlistEntry[] {
+    if (!existsSync(f)) return []
+    try {
+        const raw = JSON.parse(readFileSync(f, "utf8")) as { paths?: AllowlistEntry[] }
+        return Array.isArray(raw.paths) ? raw.paths : []
+    } catch {
+        return []
+    }
 }
 
 export class ExternalStateBackend implements StateBackend {
@@ -1013,15 +1094,15 @@ export class ExternalStateBackend implements StateBackend {
     }
 
     loadAllowlist(): AllowlistEntry[] {
-        const f = this.allowlistFile()
-        if (!existsSync(f)) return []
-        try {
-            const raw = JSON.parse(readFileSync(f, "utf8")) as { paths?: AllowlistEntry[] }
-            const entries = Array.isArray(raw.paths) ? raw.paths : []
-            return gcAllowlist(entries, (fresh) => this.saveAllowlist(fresh))
-        } catch {
-            return []
-        }
+        return gcAllowlist(parseAllowlistFile(this.allowlistFile()), (fresh) => this.saveAllowlist(fresh))
+    }
+
+    readAllowlist(): AllowlistEntry[] {
+        return parseAllowlistFile(this.allowlistFile())
+    }
+
+    auditLogPath(): string | null {
+        return this.auditFile()
     }
 
     saveAllowlist(entries: AllowlistEntry[]): void {
@@ -1118,15 +1199,15 @@ export class GitCommonStateBackend implements StateBackend {
     }
 
     loadAllowlist(): AllowlistEntry[] {
-        const f = this.allowlistFile()
-        if (!existsSync(f)) return []
-        try {
-            const raw = JSON.parse(readFileSync(f, "utf8")) as { paths?: AllowlistEntry[] }
-            const entries = Array.isArray(raw.paths) ? raw.paths : []
-            return gcAllowlist(entries, (fresh) => this.saveAllowlist(fresh))
-        } catch {
-            return []
-        }
+        return gcAllowlist(parseAllowlistFile(this.allowlistFile()), (fresh) => this.saveAllowlist(fresh))
+    }
+
+    readAllowlist(): AllowlistEntry[] {
+        return parseAllowlistFile(this.allowlistFile())
+    }
+
+    auditLogPath(): string | null {
+        return this.auditFile()
     }
 
     saveAllowlist(entries: AllowlistEntry[]): void {
@@ -1183,4 +1264,146 @@ export function createStateBackend(repoRoot: string, cfg: WorktreeConfig): State
         return new GitCommonStateBackend(repoRoot)
     }
     return new ExternalStateBackend(repoRoot)
+}
+
+export interface ReadinessResult {
+    failures: string[]
+    gitVersion: string | null
+}
+
+export function runReadinessChecks(
+    repoRoot: string,
+    gitFn: (args: string[], cwd: string) => GitResult = git,
+): ReadinessResult {
+    const failures: string[] = []
+    const v = gitFn(["--version"], repoRoot)
+    let gitVersion: string | null = null
+    if (!v.ok || !v.stdout.trim()) {
+        failures.push(`git is not available: ${(v.stderr || v.stdout || "git --version failed").trim()}`)
+    } else {
+        gitVersion = v.stdout.trim()
+    }
+    return { failures, gitVersion }
+}
+
+// Doubles as the load heartbeat: the probe entry IS the audit heartbeat record.
+export function probeStateBackend(
+    backend: StateBackend,
+    heartbeatEntry: Record<string, unknown>,
+): { ok: boolean; error?: string } {
+    try {
+        backend.appendAudit({ type: "plugin_loaded", ...heartbeatEntry })
+        backend.listBindings()
+        return { ok: true }
+    } catch (e) {
+        return { ok: false, error: (e as Error).message }
+    }
+}
+
+export function pluginVersion(): string {
+    try {
+        const require = createRequire(import.meta.url)
+        const pkg = require("../package.json") as { name?: string; version?: string }
+        return `${pkg.name ?? "opencode-worktree-isolation"}@${pkg.version ?? "?"}`
+    } catch {
+        return "opencode-worktree-isolation@?"
+    }
+}
+
+export function pluginBuildDate(): string | null {
+    try {
+        return statSync(fileURLToPath(import.meta.url)).mtime.toISOString()
+    } catch {
+        return null
+    }
+}
+
+export function tailAuditLines(auditPath: string | null, count: number): string[] {
+    if (!auditPath || !existsSync(auditPath) || count <= 0) return []
+    try {
+        const lines = readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim())
+        return lines.slice(-count)
+    } catch {
+        return []
+    }
+}
+
+export interface DoctorBindingRow {
+    branch: string
+    path: string
+    present: boolean
+    sessions: number
+    inherited: number
+    merged: boolean | null
+    dirty: boolean | null
+    isProtected: boolean
+    title: string
+}
+
+export interface DoctorHostTools {
+    status: "ok" | "missing" | "unavailable"
+    missing: string[]
+    detail?: string
+}
+
+export interface DoctorInput {
+    version: string
+    builtAt: string | null
+    loadedAt: string
+    degraded: string[]
+    configWarnings: string[]
+    gitVersion: string | null
+    stateMode: string
+    auditLogPath: string | null
+    bindings: DoctorBindingRow[]
+    allowlist: { active: number; expired: number }
+    hostTools: DoctorHostTools
+    auditTail: string[]
+}
+
+export function buildDoctorReport(input: DoctorInput): string {
+    const lines: string[] = []
+    lines.push(`worktree-doctor report (read-only)`)
+    lines.push(`  plugin:     ${input.version}`)
+    lines.push(`  built:      ${input.builtAt ?? "(unknown)"}`)
+    lines.push(`  loaded:     ${input.loadedAt}`)
+    lines.push(`  state:      ${input.stateMode}${input.auditLogPath ? `  audit: ${input.auditLogPath}` : ""}`)
+    lines.push(`  git:        ${input.gitVersion ?? "UNAVAILABLE"}`)
+    lines.push(
+        `  config:     ${input.configWarnings.length === 0 ? "ok" : `${input.configWarnings.length} warning(s):`}`,
+    )
+    for (const w of input.configWarnings) lines.push(`    - ${w}`)
+    if (input.degraded.length === 0) {
+        lines.push(`  readiness:  ✅ all checks passed`)
+    } else {
+        lines.push(`  readiness:  ⚠ DEGRADED (${input.degraded.length}):`)
+        for (const d of input.degraded) lines.push(`    - ${d}`)
+    }
+    if (input.bindings.length === 0) {
+        lines.push(`bindings:    (none — no sessions bound to worktrees)`)
+    } else {
+        lines.push(`bindings (${input.bindings.length}):`)
+        for (const b of input.bindings) {
+            const merged = b.merged === null ? "unknown" : b.merged ? "merged" : "unmerged"
+            const dirty = b.dirty === null ? "unknown" : b.dirty ? "dirty" : "clean"
+            const flag = b.isProtected ? " 🔒protected" : ""
+            lines.push(
+                `  ${b.branch.padEnd(28)} ${merged.padEnd(9)} ${dirty.padEnd(8)} ${b.present ? "present" : "MISSING"}  sessions=${b.sessions} (inherited=${b.inherited})${flag}  "${b.title}"`,
+            )
+            if (!b.present) lines.push(`    path: ${b.path}`)
+        }
+    }
+    lines.push(`allowlist:   ${input.allowlist.active} active, ${input.allowlist.expired} expired`)
+    if (input.hostTools.status === "ok") {
+        lines.push(`host tools:  ✅ all worktree_* tools registered with the host`)
+    } else if (input.hostTools.status === "missing") {
+        lines.push(`host tools:  ⚠ NOT registered with the host: ${input.hostTools.missing.join(", ")}`)
+    } else {
+        lines.push(`host tools:  (unavailable: ${input.hostTools.detail ?? "query failed"})`)
+    }
+    if (input.auditTail.length > 0) {
+        lines.push(`recent audit (last ${input.auditTail.length}):`)
+        for (const l of input.auditTail) lines.push(`  ${l}`)
+    }
+    return lines.join("\n")
 }

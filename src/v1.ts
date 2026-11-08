@@ -1,10 +1,25 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { createCore, DESCRIPTIONS, ARG_DESCRIPTIONS } from "./core.js"
+import { createCore, DESCRIPTIONS, ARG_DESCRIPTIONS, WORKTREE_TOOLS } from "./core.js"
 import type { CoreCall } from "./core.js"
+import type { DoctorHostTools } from "./lib.js"
 
 const z = tool.schema
 
 export const v1Plugin: Plugin = async (ctx) => {
+    // Shallow shape check only — actual hook wiring is verified by
+    // worktree_doctor's host-tool self-query.
+    const initDegraded: string[] = []
+    if (
+        !ctx.client ||
+        typeof ctx.client !== "object" ||
+        typeof (ctx.client as { session?: { get?: unknown } }).session?.get !== "function"
+    ) {
+        initDegraded.push(
+            "host client API shape unexpected (client.session.get missing) — opencode version drift suspected; " +
+                "sub-agent binding inheritance may not work",
+        )
+    }
+
     const core = createCore({
         repoRoot: ctx.directory,
         getParentId: async (sid) => {
@@ -14,6 +29,15 @@ export const v1Plugin: Plugin = async (ctx) => {
             } catch {
                 return undefined
             }
+        },
+        initDegraded,
+        hostToolProbe: async (): Promise<DoctorHostTools> => {
+            const res = await ctx.client.tool.ids()
+            const ids: string[] = Array.isArray(res.data) ? res.data.map(String) : []
+            const missing = WORKTREE_TOOLS.filter((t) => !ids.includes(t))
+            return missing.length > 0
+                ? { status: "missing", missing: [...missing] }
+                : { status: "ok", missing: [] }
         },
     })
 
@@ -66,6 +90,14 @@ export const v1Plugin: Plugin = async (ctx) => {
                     ttlMinutes: z.number().optional().describe(ARG_DESCRIPTIONS.allow.ttlMinutes),
                 },
                 execute: (args, tctx) => core.allow(args, makeCall(tctx)),
+            }),
+
+            worktree_doctor: tool({
+                description: DESCRIPTIONS.doctor,
+                args: {
+                    auditLines: z.number().int().min(1).max(50).optional().describe(ARG_DESCRIPTIONS.doctor.auditLines),
+                },
+                execute: (args, tctx) => core.doctor(args, makeCall(tctx)),
             }),
         },
 
