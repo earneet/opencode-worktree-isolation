@@ -1079,7 +1079,11 @@ describe("norm() Win32 trailing dots and spaces (review P0-2)", () => {
     })
 
     test("segments without trailing dots/spaces are unchanged", () => {
-        assert.equal(norm("F:/Repo/Sub/File.TXT"), "f:/repo/sub/file.txt")
+        if (process.platform === "win32") {
+            assert.equal(norm("F:/Repo/Sub/File.TXT"), "f:/repo/sub/file.txt")
+        } else {
+            assert.equal(norm("/Repo/Sub/File.TXT"), "/repo/sub/file.txt")
+        }
     })
 })
 
