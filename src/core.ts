@@ -130,6 +130,19 @@ export interface WorktreeCore {
     onSessionDeleted(sessionId: string): void
 }
 
+// session_move can re-anchor the plugin (and thus call.directory) inside the
+// worktree itself; taking that directory as the main checkout would run
+// symbolic-ref / status / merge / branch -d against the WORKTREE (issue #13:
+// "main checkout is already on <branch>" false positive). Prefer the root
+// recorded at prepare time; derive it from the worktree's git common dir when
+// that record is unusable.
+function resolveMainCheckout(preferred: string, worktreePath: string): string {
+    if (preferred && norm(preferred) !== norm(worktreePath) && existsSync(preferred)) return preferred
+    const r = git(["rev-parse", "--git-common-dir"], worktreePath)
+    if (r.ok && r.stdout.trim()) return path.dirname(path.resolve(worktreePath, r.stdout.trim()))
+    return preferred
+}
+
 export function createCore(opts: CoreOptions): WorktreeCore {
     const repoRoot = opts.repoRoot
     const getParentId = opts.getParentId
@@ -498,7 +511,6 @@ export function createCore(opts: CoreOptions): WorktreeCore {
     }
 
     async function merge(args: MergeArgs, call: CoreCall): Promise<string> {
-        const R = call.directory
         const state = stateBackend.loadAll()
 
         let branch = args.branch
@@ -516,7 +528,7 @@ export function createCore(opts: CoreOptions): WorktreeCore {
         const binding = boundSid ? state.sessions[boundSid] : null
         if (!binding) return `❌ No managed worktree found for branch "${branch}".`
         const W = binding.path
-
+        const R = resolveMainCheckout(binding.repoRoot || call.directory, W)
         const targetRes = git(["symbolic-ref", "--short", "HEAD"], R)
         if (!targetRes.ok)
             return `❌ Cannot determine the current branch of ${R}: ${targetRes.stderr.trim()}`

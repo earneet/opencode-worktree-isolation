@@ -66,6 +66,8 @@ function makeV1Harness(repoDir, SESSION) {
         prepare: (args, sid = SESSION) => hooks.tool.worktree_prepare.execute(args, makeTctx(sid)),
         cleanupWorktrees: (args, sid = SESSION) => hooks.tool.worktree_cleanup.execute(args, makeTctx(sid)),
         merge: (args, sid = SESSION) => hooks.tool.worktree_merge.execute(args, makeTctx(sid)),
+        mergeFrom: (dir, args, sid = SESSION) =>
+            hooks.tool.worktree_merge.execute(args, { directory: dir, sessionID: sid, metadata: () => {} }),
         allow: (args, sid = SESSION) => hooks.tool.worktree_allow.execute(args, makeTctx(sid)),
         async intercept(tool, args, sid = SESSION) {
             await hooks["tool.execute.before"]({ tool, sessionID: sid, callID: "c" }, { args })
@@ -146,6 +148,17 @@ function makeV2Harness(repoDir, SESSION) {
         prepare: (args, sid = SESSION) => unwrap(tools.get("worktree_prepare").execute(args, callCtx(sid))),
         cleanupWorktrees: (args, sid = SESSION) => unwrap(tools.get("worktree_cleanup").execute(args, callCtx(sid))),
         merge: (args, sid = SESSION) => unwrap(tools.get("worktree_merge").execute(args, callCtx(sid))),
+        // Simulates session_move: the host re-anchors a plugin instance to the
+        // worktree location, so call.directory inside core becomes the worktree.
+        async mergeFrom(dir, args, sid = SESSION) {
+            const moved = makeV2Harness(dir, SESSION)
+            await moved.init()
+            try {
+                return await moved.merge(args, sid)
+            } finally {
+                await moved.dispose()
+            }
+        },
         allow: (args, sid = SESSION) => unwrap(tools.get("worktree_allow").execute(args, callCtx(sid))),
         async intercept(tool, args, sid = SESSION) {
             await toolHooks.get("execute.before")({ tool, ...callCtx(sid), input: args })
@@ -347,6 +360,29 @@ for (const [label, makeHarness] of harnessMakers) {
             assert.ok(result.includes("wt/cleanup-test: removed"), `cleanup should remove, got: ${result}`)
             assert.ok(!existsSync(wtPath), "worktree dir removed after cleanup")
             assert.ok(!loadState(pid).sessions[SESSION], "session unbound after cleanup")
+        })
+
+        test(`merge targets the real main checkout when the session moved into the worktree (session_move, issue #13) (${label})`, async () => {
+            const prep = await h.prepare({ title: "moved session" })
+            assert.ok(prep.startsWith("✅"), `prepare should succeed: ${prep}`)
+            const pid = computeProjectId(repoDir)
+            const binding = loadState(pid).sessions[SESSION]
+            const movedWt = binding.path
+            writeFileSync(path.join(movedWt, "moved.txt"), "moved session work\n")
+            assert.ok(git(["add", "moved.txt"], movedWt).ok)
+            assert.ok(git(["commit", "-m", "work from moved session"], movedWt).ok)
+
+            const preview = await h.mergeFrom(movedWt, { action: "preview" })
+            assert.ok(preview.includes("Merge preview"), `preview must succeed, got:\n${preview}`)
+            assert.ok(
+                !preview.includes("already on"),
+                `the worktree must not be mistaken for the main checkout, got:\n${preview}`,
+            )
+
+            const result = await h.mergeFrom(movedWt, { action: "apply" })
+            assert.ok(result.startsWith("✅"), `merge should succeed, got: ${result}`)
+            assert.ok(existsSync(path.join(repoDir, "moved.txt")), "merged file must land in the real main checkout")
+            assert.ok(!existsSync(movedWt), "worktree must be removed after merge")
         })
 
         test(`worktree_cleanup refuses to remove worktree still bound by another session (${label})`, async () => {
